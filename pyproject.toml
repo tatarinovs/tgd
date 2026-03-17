@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgd"
+version = "1.1.0"
+description = "Fast Telegram Media Downloader with parallel downloads and integrity verification."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "User" }
+]
+dependencies = [
+    "telethon==1.41.2",
+    "python-dotenv==1.0.1",
+    "tqdm==4.67.1",
+    "cryptg==0.5.1",
+    "FastTelethonhelper==1.0.7",
+    "Pillow==11.1.0",
+    "opencv-python==4.11.0.86",
+]
+
+[project.scripts]
+tgd = "main:main"
+tgv = "verify:main"
+
+[tool.setuptools]
+py-modules = ["main", "verify"]

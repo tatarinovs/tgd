@@ -1,0 +1,7 @@
+.env
+*.session
+*.tmp
+*.exe
+*.bat
+*.cmd
+__pycache__/
