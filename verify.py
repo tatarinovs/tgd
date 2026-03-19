@@ -7,10 +7,19 @@ import cv2
 from tqdm import tqdm
 import shutil
 
+# Кастомный поток для tqdm
+class TqdmStream:
+    def write(self, x):
+        if len(x.rstrip()) > 0:
+            tqdm.write(x, end='')
+    def flush(self):
+        pass
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(levelname)s - %(message)s'
+    format='%(levelname)s - %(message)s',
+    stream=TqdmStream()
 )
 logger = logging.getLogger(__name__)
 

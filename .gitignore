@@ -4,4 +4,5 @@
 *.exe
 *.bat
 *.cmd
+rename_old_files.py
 __pycache__/
