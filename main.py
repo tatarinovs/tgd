@@ -2,13 +2,15 @@ import os
 import argparse
 import logging
 import asyncio
+import sys
+import threading
 import glob
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo
 )
-from tqdm.asyncio import tqdm
+from tqdm import tqdm
 
 try:
     from FastTelethonhelper import download_file as fast_download
@@ -32,6 +34,10 @@ logging.basicConfig(
     stream=TqdmStream()
 )
 logger = logging.getLogger(__name__)
+
+# Убираем назойливые INFO логи от библиотек
+logging.getLogger('FastTelethonhelper').setLevel(logging.WARNING)
+logging.getLogger('telethon').setLevel(logging.WARNING)
 
 if not HAS_FAST:
     logger.warning("FastTelethonhelper не найден — тяжёлые файлы будут качаться стандартным методом")
@@ -77,7 +83,7 @@ class SmartDownloader:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TGD: Загрузчик из Telegram")
-    parser.add_argument('group_id', type=int, help="ID группы")
+    parser.add_argument('group_id', type=str, help="ID группы или ссылка (@username, https://t.me/...)")
     parser.add_argument('output_dir', type=str, help="Папка сохранения")
     parser.add_argument('--env', type=str, default='.env', help="Путь до .env")
     parser.add_argument('--timeout', type=int, default=3600, help="Таймаут на файл")
@@ -126,7 +132,7 @@ def resolve_file_name(message) -> tuple:
     return None, False
 
 
-async def download_task(client, message, output_dir, timeout, retries, downloader):
+async def download_task(client, message, output_dir, timeout, retries, downloader, cancel):
     file_name, is_heavy = resolve_file_name(message)
     if not file_name:
         return "skipped"
@@ -139,6 +145,8 @@ async def download_task(client, message, output_dir, timeout, retries, downloade
 
     await downloader.acquire(is_heavy)
     try:
+        if cancel.is_set():
+            return "skipped"
         for attempt in range(retries):
             try:
                 with tqdm(unit='B', unit_scale=True, desc=file_name[:25], leave=False) as pbar:
@@ -190,25 +198,20 @@ async def download_task(client, message, output_dir, timeout, retries, downloade
         await downloader.release(is_heavy)
 
 
-async def worker(queue, client, output_dir, timeout, retries, downloader, stats):
+async def worker(queue, client, output_dir, timeout, retries, downloader, stats, cancel):
     """Воркер из пула — тянет задачи из очереди до sentinel (None)."""
     while True:
         message = await queue.get()
         if message is None:
             queue.task_done()
             break
+        if cancel.is_set():
+            queue.task_done()
+            continue
         try:
-            result = await download_task(client, message, output_dir, timeout, retries, downloader)
-            stats[result] = stats.get(result, 0) + 1
-
-            total = sum(stats.values())
-            if total % 50 == 0:
-                logger.info(
-                    f"Прогресс: Новых {stats.get('done', 0)}, "
-                    f"Существует {stats.get('exists', 0)}, "
-                    f"Пропущено {stats.get('skipped', 0)}, "
-                    f"Ошибок {stats.get('error', 0)}"
-                )
+            result = await download_task(client, message, output_dir, timeout, retries, downloader, cancel)
+            if not (cancel.is_set() and result == "skipped"):
+                stats[result] = stats.get(result, 0) + 1
         except Exception as e:
             logger.error(f"Необработанная ошибка воркера: {e}")
             stats["error"] = stats.get("error", 0) + 1
@@ -216,10 +219,7 @@ async def worker(queue, client, output_dir, timeout, retries, downloader, stats)
             queue.task_done()
 
 
-async def main():
-    args = parse_args()
-    load_dotenv(args.env)
-
+async def run(args, stats, cancel):
     api_id = os.getenv('APP_API_ID')
     api_hash = os.getenv('APP_API_HASH')
     phone = os.getenv('PHONE_NUMBER')
@@ -231,13 +231,12 @@ async def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Убираем незавершённые загрузки прошлого запуска
-    for tmp in glob.glob(os.path.join(args.output_dir, "*.part")):
+    for tmp in glob.iglob(os.path.join(args.output_dir, "*.part")):
         os.remove(tmp)
 
     downloader = SmartDownloader(light_limit=5)
     # back-pressure: продюсер встанет, если воркеры не успевают
     queue = asyncio.Queue(maxsize=args.queue_size)
-    stats = {"done": 0, "exists": 0, "error": 0, "skipped": 0}
 
     async with TelegramClient('tg_session', int(api_id), api_hash) as client:
         if not await client.is_user_authorized():
@@ -245,8 +244,12 @@ async def main():
             await client.sign_in(phone, input('Код: '))
 
         try:
-            entity = await client.get_entity(args.group_id)
-            logger.info(f"Старт: {getattr(entity, 'title', args.group_id)}")
+            group_input = args.group_id
+            if group_input.lstrip('-').isdigit():
+                group_input = int(group_input)
+                
+            entity = await client.get_entity(group_input)
+            logger.info(f"Старт: {getattr(entity, 'title', str(group_input))}")
         except Exception as e:
             logger.error(f"Ошибка доступа к группе: {e}")
             return
@@ -254,13 +257,15 @@ async def main():
         # Запускаем пул воркеров
         workers = [
             asyncio.create_task(
-                worker(queue, client, args.output_dir, args.timeout, args.retries, downloader, stats)
+                worker(queue, client, args.output_dir, args.timeout, args.retries, downloader, stats, cancel)
             )
             for _ in range(args.workers)
         ]
 
         # Продюсер: кладём сообщения в очередь (блокируется при maxsize)
         async for message in client.iter_messages(entity):
+            if cancel.is_set():
+                break
             if message.media:
                 await queue.put(message)
 
@@ -271,6 +276,48 @@ async def main():
         await queue.join()
         await asyncio.gather(*workers)
 
+
+def main():
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    args = parse_args()
+    load_dotenv(args.env)
+    
+    cancel = threading.Event()
+    stats = {"done": 0, "exists": 0, "error": 0, "skipped": 0}
+    done = threading.Event()
+
+    def _run_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run(args, stats, cancel))
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {e}")
+        finally:
+            loop.close()
+            done.set()
+
+    thread = threading.Thread(target=_run_thread, daemon=True)
+    thread.start()
+
+    try:
+        # join()/wait() с таймаутом — надёжный способ поймать Ctrl+C на Windows
+        while not done.wait(timeout=0.2):
+            pass
+    except KeyboardInterrupt:
+        sys.stderr.write("\r\033[K\033[33m[СТОП] Завершаем текущие загрузки... (повторный Ctrl+C — прервать немедленно)\033[0m\n")
+        sys.stderr.flush()
+        cancel.set()
+        try:
+            while not done.wait(timeout=0.2):
+                pass
+        except KeyboardInterrupt:
+            sys.stderr.write("\r\033[K\033[1;31m[ПРИНУДИТЕЛЬНО] Прерываем немедленно...\033[0m\n")
+            sys.stderr.flush()
+            sys.exit(1)
+
     print()
     logger.info(
         f"Завершено! Новых: {stats.get('done', 0)}, "
@@ -279,11 +326,5 @@ async def main():
         f"Ошибок: {stats.get('error', 0)}"
     )
 
-
 if __name__ == '__main__':
-    if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Остановлено пользователем")
+    main()
