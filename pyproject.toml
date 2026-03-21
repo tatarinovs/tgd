@@ -19,6 +19,7 @@ dependencies = [
     "FastTelethonhelper==1.0.7",
     "Pillow==11.1.0",
     "opencv-python==4.11.0.86",
+    "python-socks[asyncio]>=2.4.4",
 ]
 
 [project.scripts]

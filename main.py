@@ -86,10 +86,11 @@ def parse_args():
     parser.add_argument('group_id', type=str, help="ID группы или ссылка (@username, https://t.me/...)")
     parser.add_argument('output_dir', type=str, help="Папка сохранения")
     parser.add_argument('--env', type=str, default='.env', help="Путь до .env")
-    parser.add_argument('--timeout', type=int, default=3600, help="Таймаут на файл")
-    parser.add_argument('--retries', type=int, default=3, help="Попыток при сбое")
-    parser.add_argument('--workers', type=int, default=6, help="Количество воркеров")
-    parser.add_argument('--queue-size', type=int, default=50, help="Размер очереди (back-pressure)")
+    parser.add_argument('--timeout', type=int, default=None, help="Таймаут на файл (переопределяет .env TIMEOUT)")
+    parser.add_argument('--retries', type=int, default=None, help="Попыток при сбое (переопределяет .env RETRIES)")
+    parser.add_argument('--workers', type=int, default=None, help="Количество воркеров (переопределяет .env WORKERS)")
+    parser.add_argument('--queue-size', type=int, default=None, help="Размер очереди (переопределяет .env QUEUE_SIZE)")
+    parser.add_argument('--proxy', type=str, default=None, help="SOCKS5/HTTP прокси, например: socks5://192.168.1.10:10808")
     return parser.parse_args()
 
 
@@ -224,6 +225,12 @@ async def run(args, stats, cancel):
     api_hash = os.getenv('APP_API_HASH')
     phone = os.getenv('PHONE_NUMBER')
 
+    # Слияние аргументов консоли с переменными окружения (.env)
+    args.timeout = args.timeout if args.timeout is not None else int(os.getenv('TIMEOUT', 3600))
+    args.retries = args.retries if args.retries is not None else int(os.getenv('RETRIES', 3))
+    args.workers = args.workers if args.workers is not None else int(os.getenv('WORKERS', 6))
+    args.queue_size = args.queue_size if args.queue_size is not None else int(os.getenv('QUEUE_SIZE', 50))
+
     if not all([api_id, api_hash, phone]):
         logger.error("Ошибка: не заданы APP_API_ID, APP_API_HASH или PHONE_NUMBER в .env")
         return
@@ -238,7 +245,23 @@ async def run(args, stats, cancel):
     # back-pressure: продюсер встанет, если воркеры не успевают
     queue = asyncio.Queue(maxsize=args.queue_size)
 
-    async with TelegramClient('tg_session', int(api_id), api_hash) as client:
+    proxy_dict = None
+    p_url = args.proxy or os.getenv('PROXY')
+    if p_url:
+        try:
+            import python_socks
+            from urllib.parse import urlparse
+            parsed = urlparse(p_url)
+            ptype = python_socks.ProxyType.SOCKS5 if parsed.scheme.startswith('socks') else python_socks.ProxyType.HTTP
+            proxy_dict = {'proxy_type': ptype, 'addr': parsed.hostname, 'port': parsed.port}
+            if parsed.username:
+                proxy_dict['username'] = parsed.username
+                proxy_dict['password'] = parsed.password
+            logger.info(f"Используется прокси: {p_url}")
+        except Exception as e:
+            logger.warning(f"Ошибка парсинга прокси {p_url}: {e}")
+
+    async with TelegramClient('tg_session', int(api_id), api_hash, proxy=proxy_dict) as client:
         if not await client.is_user_authorized():
             await client.send_code_request(phone)
             await client.sign_in(phone, input('Код: '))
