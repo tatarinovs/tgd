@@ -23,8 +23,8 @@ dependencies = [
 ]
 
 [project.scripts]
-tgd = "main:main"
+tgd = "tgd:main"
 tgv = "verify:main"
 
 [tool.setuptools]
-py-modules = ["main", "verify"]
+py-modules = ["tgd", "verify"]

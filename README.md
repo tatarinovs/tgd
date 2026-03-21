@@ -58,7 +58,7 @@ PHONE_NUMBER=+79991234567
 Запустите скрипт через терминал:
 
 ```bash
-python main.py [GROUP_ID] [OUTPUT_DIR]
+python tgd.py [GROUP_ID] [OUTPUT_DIR]
 ```
 
 ### Параметры:
@@ -76,7 +76,7 @@ python main.py [GROUP_ID] [OUTPUT_DIR]
 ## Пример
 
 ```bash
-python main.py -1001234567890 downloads/my_channel
+python tgd.py -1001234567890 downloads/my_channel
 ```
 
 ## Как это работает (PRO)
