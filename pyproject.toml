@@ -7,7 +7,7 @@ name = "tgd"
 version = "1.1.0"
 description = "Fast Telegram Media Downloader with parallel downloads and integrity verification."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [
     { name = "User" }
 ]
@@ -21,6 +21,9 @@ dependencies = [
     "opencv-python==4.11.0.86",
     "python-socks[asyncio]>=2.4.4",
 ]
+
+[project.optional-dependencies]
+proxy = ["cryptography>=41.0"]
 
 [project.scripts]
 tgd = "tgd:main"

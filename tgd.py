@@ -90,7 +90,7 @@ def parse_args():
     parser.add_argument('--retries', type=int, default=None, help="Попыток при сбое (переопределяет .env RETRIES)")
     parser.add_argument('--workers', type=int, default=None, help="Количество воркеров (переопределяет .env WORKERS)")
     parser.add_argument('--queue-size', type=int, default=None, help="Размер очереди (переопределяет .env QUEUE_SIZE)")
-    parser.add_argument('--proxy', type=str, default=None, help="SOCKS5/HTTP прокси, например: socks5://192.168.1.10:10808")
+    parser.add_argument('--proxy', type=str, default=None, help="SOCKS5/HTTP/MTProto прокси (например: tg://proxy?server=...)")
     return parser.parse_args()
 
 
@@ -106,15 +106,16 @@ def resolve_file_name(message) -> tuple:
 
     if isinstance(media, MessageMediaDocument):
         doc = media.document
+        attrs = doc.attributes or []
         is_round = any(
             isinstance(a, DocumentAttributeVideo) and a.round_message
-            for a in doc.attributes
+            for a in attrs
         )
         if is_round:
             return f"{message.id}_round.mp4", True
 
         orig_name = next(
-            (a.file_name for a in doc.attributes if hasattr(a, 'file_name')),
+            (a.file_name for a in attrs if hasattr(a, 'file_name')),
             None
         )
         if orig_name:
@@ -245,23 +246,55 @@ async def run(args, stats, cancel):
     # back-pressure: продюсер встанет, если воркеры не успевают
     queue = asyncio.Queue(maxsize=args.queue_size)
 
-    proxy_dict = None
+    client_kwargs = {}
     p_url = args.proxy or os.getenv('PROXY')
     if p_url:
         try:
-            import python_socks
-            from urllib.parse import urlparse
+            from urllib.parse import urlparse, parse_qs
             parsed = urlparse(p_url)
-            ptype = python_socks.ProxyType.SOCKS5 if parsed.scheme.startswith('socks') else python_socks.ProxyType.HTTP
-            proxy_dict = {'proxy_type': ptype, 'addr': parsed.hostname, 'port': parsed.port}
-            if parsed.username:
-                proxy_dict['username'] = parsed.username
-                proxy_dict['password'] = parsed.password
-            logger.info(f"Используется прокси: {p_url}")
+            
+            is_tg_proxy = (parsed.scheme == 'tg' and parsed.netloc == 'proxy')
+            is_mtproxy_scheme = parsed.scheme in ('mtproxy', 'mtproto')
+            
+            if is_tg_proxy or is_mtproxy_scheme:
+                qs = parse_qs(parsed.query)
+                if is_tg_proxy:
+                    server = qs.get('server', [''])[0]
+                    port = int(qs.get('port', ['0'])[0])
+                else:
+                    server = parsed.hostname
+                    port = parsed.port
+                
+                secret = qs.get('secret', [''])[0]
+                
+                client_kwargs['proxy'] = (server, port, secret)
+                if secret.lower().startswith('ee'):
+                    try:
+                        from TelethonFakeTLS import ConnectionTcpMTProxyFakeTLS
+                        client_kwargs['connection'] = ConnectionTcpMTProxyFakeTLS
+                        logger.info(f"Используется MTProto FakeTLS прокси: {server}:{port}")
+                    except ImportError:
+                        logger.warning("Секрет начинается с 'ee' (FakeTLS), но модуль TelethonFakeTLS не загружен. Подключение может не удаться.")
+                        from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate
+                        client_kwargs['connection'] = ConnectionTcpMTProxyRandomizedIntermediate
+                        logger.info(f"Используется MTProto прокси: {server}:{port}")
+                else:
+                    from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate
+                    client_kwargs['connection'] = ConnectionTcpMTProxyRandomizedIntermediate
+                    logger.info(f"Используется MTProto прокси: {server}:{port}")
+            else:
+                import python_socks
+                ptype = python_socks.ProxyType.SOCKS5 if parsed.scheme.startswith('socks') else python_socks.ProxyType.HTTP
+                proxy_dict = {'proxy_type': ptype, 'addr': parsed.hostname, 'port': parsed.port}
+                if parsed.username:
+                    proxy_dict['username'] = parsed.username
+                    proxy_dict['password'] = parsed.password
+                client_kwargs['proxy'] = proxy_dict
+                logger.info(f"Используется прокси: {p_url}")
         except Exception as e:
             logger.warning(f"Ошибка парсинга прокси {p_url}: {e}")
 
-    async with TelegramClient('tg_session', int(api_id), api_hash, proxy=proxy_dict) as client:
+    async with TelegramClient('tg_session', int(api_id), api_hash, **client_kwargs) as client:
         if not await client.is_user_authorized():
             await client.send_code_request(phone)
             await client.sign_in(phone, input('Код: '))
