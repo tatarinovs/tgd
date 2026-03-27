@@ -82,9 +82,10 @@ class FakeTLSStreamReader(LayeredStreamReaderBase):
             tls_data = await self.read(1, ignore_buf=True)
             if not tls_data:
                 return b""
-            self.buf += tls_data
-        data, self.buf = self.buf[:n], self.buf[n:]
-        return bytes(data)
+            self.buf.extend(tls_data)
+        data = bytes(self.buf[:n])
+        del self.buf[:n]
+        return data
 
     async def read_server_hello(self) -> bytes:
         server_hello = await super().readexactly(127 + 6 + 3 + 2)
@@ -104,7 +105,6 @@ class FakeTLSStreamWriter(LayeredStreamWriterBase):
         max_chunk_size = 16384 + 24
         for start in range(0, len(data), max_chunk_size):
             end = min(start + max_chunk_size, len(data))
-            self.upstream.write(
-                b"\x17\x03\x03" + int.to_bytes(end - start, 2, "big"))
-            self.upstream.write(data[start: end])
+            header = b"\x17\x03\x03" + int.to_bytes(end - start, 2, "big")
+            self.upstream.write(header + data[start:end])
         return len(data)

@@ -12,6 +12,46 @@ from telethon.tl.types import (
 )
 from tqdm import tqdm
 
+
+# ── Monkey-patch: ускорение AES-CTR для MTProxy ──────────────────────
+# Telethon использует чистый Python (pyaes) для AES-CTR в обфускации
+# MTProxy, что ограничивает скорость ~0.5 MB/s.
+# Заменяем на cryptography (OpenSSL/C) → ~2300 MB/s.
+try:
+    from cryptography.hazmat.primitives.ciphers import (
+        Cipher as _Cipher, algorithms as _alg, modes as _modes
+    )
+
+    class _FastAESModeCTR:
+        __slots__ = ('_enc', '_dec')
+
+        def __init__(self, key, iv):
+            assert isinstance(key, bytes)
+            assert isinstance(iv, bytes) and len(iv) == 16
+            cipher = _Cipher(_alg.AES(key), _modes.CTR(iv))
+            self._enc = cipher.encryptor()
+            self._dec = cipher.decryptor()
+
+        def encrypt(self, data):
+            return self._enc.update(data)
+
+        def decrypt(self, data):
+            return self._dec.update(data)
+
+    # Патчим все модули, которые хранят ссылку на AESModeCTR
+    import telethon.crypto.aesctr as _aesctr_mod
+    _aesctr_mod.AESModeCTR = _FastAESModeCTR
+    import telethon.crypto as _crypto_mod
+    _crypto_mod.AESModeCTR = _FastAESModeCTR
+    # from-импорты копируют ссылку — нужно патчить и конечные модули
+    import telethon.network.connection.tcpmtproxy as _mtproxy_mod
+    _mtproxy_mod.AESModeCTR = _FastAESModeCTR
+    import telethon.network.connection.tcpobfuscated as _obfs_mod
+    _obfs_mod.AESModeCTR = _FastAESModeCTR
+except ImportError:
+    pass
+# ─────────────────────────────────────────────────────────────────────
+
 try:
     from FastTelethonhelper import download_file as fast_download
     HAS_FAST = True
