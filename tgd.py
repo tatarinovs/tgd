@@ -5,6 +5,7 @@ import asyncio
 import sys
 import threading
 import glob
+import time
 from collections import Counter
 from dotenv import load_dotenv
 from telethon import TelegramClient
@@ -100,6 +101,7 @@ def parse_args():
     parser.add_argument('--heavy-threshold', type=int, default=None, help="Порог 'тяжёлого' файла в МБ (переопределяет .env HEAVY_THRESHOLD)")
     parser.add_argument('--queue-size', type=int, default=None, help="Размер очереди (переопределяет .env QUEUE_SIZE)")
     parser.add_argument('--proxy', type=str, default=None, help="SOCKS5/HTTP/MTProto прокси (например: tg://proxy?server=...)")
+    parser.add_argument('--topic', type=str, default=None, help="Название темы (раздела) или ID темы для скачивания только из неё")
     return parser.parse_args()
 
 
@@ -232,8 +234,8 @@ async def worker(queue, client, output_dir, timeout, retries, stats, stats_lock,
 
         try:
             result = await download_task(client, message, file_name, is_heavy, output_dir, timeout, retries, cancel)
-            # Не считаем skipped-результаты при отмене — они искажают статистику
-            if result != "skipped" or not cancel.is_set():
+            # Не считаем skipped — воркер пропустил задачу из-за отмены
+            if result != "skipped":
                 with stats_lock:
                     stats[result] += 1
         except Exception as e:
@@ -248,7 +250,7 @@ async def authorize(client, phone):
     """
     Авторизация: поддерживает 2FA (пароль) и не блокирует event loop на вводе.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     await client.send_code_request(phone)
     code = await loop.run_in_executor(None, lambda: input('Код подтверждения: ').strip())
@@ -325,7 +327,7 @@ async def run(args, stats, stats_lock, cancel):
     args.workers = args.workers if args.workers is not None else int(os.getenv('WORKERS', 6))
     args.heavy_workers = args.heavy_workers if args.heavy_workers is not None else int(os.getenv('HEAVY_WORKERS', 1))
     
-    env_heavy_threshold = os.getenv('HEAVY_THRESHOLD', 100)
+    env_heavy_threshold = os.getenv('HEAVY_THRESHOLD', '100')
     args.heavy_threshold = args.heavy_threshold if args.heavy_threshold is not None else int(env_heavy_threshold)
     heavy_threshold_bytes = args.heavy_threshold * 1024 * 1024
     
@@ -340,11 +342,9 @@ async def run(args, stats, stats_lock, cancel):
     # Убираем незавершённые загрузки прошлого запуска.
     # Только файлы старше 60 секунд — чтобы не трогать активные загрузки
     # при случайном параллельном запуске.
-    now = asyncio.get_event_loop().time()
-    import time as _time
     for tmp in glob.iglob(os.path.join(args.output_dir, "*.part")):
         try:
-            if _time.time() - os.path.getmtime(tmp) > 60:
+            if time.time() - os.path.getmtime(tmp) > 60:
                 os.remove(tmp)
         except OSError:
             pass
@@ -376,6 +376,44 @@ async def run(args, stats, stats_lock, cancel):
             logger.error(f"Ошибка доступа к группе: {e}")
             return
 
+        topic_id = None
+        if args.topic:
+            from telethon.tl.functions.channels import GetForumTopicsRequest
+            try:
+                topic_id = int(args.topic)
+                logger.info(f"Фильтрация по ID темы: {topic_id}")
+            except ValueError:
+                logger.info(f"Поиск темы с названием: '{args.topic}'...")
+                try:
+                    result = await client(GetForumTopicsRequest(
+                        channel=entity,
+                        offset_date=None,
+                        offset_id=0,
+                        offset_topic=0,
+                        limit=100
+                    ))
+                    
+                    matched_topic = None
+                    if result and hasattr(result, 'topics'):
+                        for t in result.topics:
+                            if args.topic.lower() in t.title.lower():
+                                matched_topic = t
+                                break
+                    
+                    if matched_topic:
+                        topic_id = matched_topic.id
+                        logger.info(f"Найдена тема '{matched_topic.title}' с ID: {topic_id}")
+                    else:
+                        logger.error(f"Тема '{args.topic}' не найдена!")
+                        if result and hasattr(result, 'topics') and result.topics:
+                            logger.info("Доступные темы в этой группе:")
+                            for t in result.topics:
+                                logger.info(f" - {t.title} (ID: {t.id})")
+                        return
+                except Exception as e:
+                    logger.error(f"Не удалось получить список тем (возможно, группа не является форумом): {e}")
+                    return
+
         worker_kwargs = dict(
             client=client,
             output_dir=args.output_dir,
@@ -399,7 +437,11 @@ async def run(args, stats, stats_lock, cancel):
         ]
 
         # Продюсер: распределяет сообщения по очередям
-        async for message in client.iter_messages(entity):
+        iter_kwargs = {}
+        if topic_id is not None:
+            iter_kwargs['reply_to'] = topic_id
+
+        async for message in client.iter_messages(entity, **iter_kwargs):
             if cancel.is_set():
                 break
             if message.media:
