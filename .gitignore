@@ -7,3 +7,5 @@
 *.cmd
 rename_old_files.py
 __pycache__/
+dist/
+build/

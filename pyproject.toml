@@ -15,19 +15,25 @@ dependencies = [
     "telethon==1.41.2",
     "python-dotenv==1.0.1",
     "tqdm==4.67.1",
-    "cryptg==0.5.1",
-    "FastTelethonhelper==1.0.7",
-    "Pillow==11.1.0",
-    "opencv-python==4.11.0.86",
     "python-socks[asyncio]>=2.4.4",
 ]
 
 [project.optional-dependencies]
-proxy = ["cryptography>=41.0"]
+# pip install tgd[fast] — ускорение AES + многопоточная загрузка тяжёлых файлов
+fast = [
+    "cryptg>=0.5",
+    "cryptography>=41.0",
+    "FastTelethonhelper==1.0.7",
+]
+# pip install tgd[verify] — проверка целостности медиафайлов
+verify = [
+    "Pillow>=10.0",
+    "opencv-python>=4.8",
+]
 
 [project.scripts]
 tgd = "tgd:main"
 tgv = "verify:main"
 
 [tool.setuptools]
-py-modules = ["tgd", "verify"]
+py-modules = ["tgd", "verify", "utils"]

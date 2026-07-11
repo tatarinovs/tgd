@@ -1,4 +1,5 @@
 import os
+import re
 import argparse
 import logging
 import asyncio
@@ -14,6 +15,7 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo
 )
 from tqdm import tqdm
+from utils import TqdmStream
 
 
 # ── Monkey-patch: ускорение AES-CTR для MTProxy ──────────────────────
@@ -29,8 +31,10 @@ try:
         __slots__ = ('_enc', '_dec')
 
         def __init__(self, key, iv):
-            assert isinstance(key, bytes)
-            assert isinstance(iv, bytes) and len(iv) == 16
+            if not isinstance(key, bytes):
+                raise TypeError(f"AES key must be bytes, got {type(key)}")
+            if not isinstance(iv, bytes) or len(iv) != 16:
+                raise ValueError(f"AES iv must be 16 bytes, got {len(iv) if isinstance(iv, bytes) else type(iv)}")
             cipher = _Cipher(_alg.AES(key), _modes.CTR(iv))
             self._enc = cipher.encryptor()
             self._dec = cipher.decryptor()
@@ -64,14 +68,7 @@ except ImportError:
 
 
 
-# Кастомный поток для перенаправления вывода в tqdm.write
-class TqdmStream:
-    def write(self, x):
-        if len(x.rstrip()) > 0:
-            tqdm.write(x, end='')
-
-    def flush(self):
-        pass
+# TqdmStream импортируется из utils.py
 
 
 logging.basicConfig(
@@ -83,10 +80,17 @@ logger = logging.getLogger(__name__)
 
 # Убираем назойливые INFO логи от библиотек
 logging.getLogger('FastTelethonhelper').setLevel(logging.WARNING)
-logging.getLogger('telethon').setLevel(logging.WARNING)
+logging.getLogger('telethon').setLevel(logging.ERROR)
 
 if not HAS_FAST:
     logger.warning("FastTelethonhelper не найден — тяжёлые файлы будут качаться стандартным методом")
+
+
+def _get_app_dir() -> str:
+    """Возвращает директорию .exe при запуске как frozen, иначе директорию скрипта."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def parse_args():
@@ -103,6 +107,16 @@ def parse_args():
     parser.add_argument('--proxy', type=str, default=None, help="SOCKS5/HTTP/MTProto прокси (например: tg://proxy?server=...)")
     parser.add_argument('--topic', type=str, default=None, help="Название темы (раздела) или ID темы для скачивания только из неё")
     return parser.parse_args()
+
+
+_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_filename(name: str, max_len: int = 200) -> str:
+    """Очищает имя файла от опасных символов (path traversal, Windows-запрещённые)."""
+    name = _UNSAFE_CHARS.sub('_', name)
+    name = name.strip('. ')
+    return name[:max_len] or 'file'
 
 
 def resolve_file_name(message, heavy_threshold_bytes: int) -> tuple:
@@ -133,7 +147,7 @@ def resolve_file_name(message, heavy_threshold_bytes: int) -> tuple:
             None
         )
         if orig_name:
-            return f"{message.id}_{orig_name}", is_heavy
+            return f"{message.id}_{sanitize_filename(orig_name)}", is_heavy
 
         mime = doc.mime_type or ""
         ext = mime.split('/')[-1].split(';')[0]
@@ -199,8 +213,13 @@ async def download_task(client, message, file_name, is_heavy, output_dir, timeou
                             timeout=timeout
                         )
 
-            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-                raise ValueError("Downloaded file is empty")
+            try:
+                actual_size = os.path.getsize(tmp_path)
+            except OSError:
+                actual_size = 0
+            expected_size = getattr(message.file, 'size', None)
+            if not actual_size or (expected_size and actual_size < expected_size * 0.99):
+                raise ValueError(f"Неполная загрузка: {actual_size}/{expected_size} байт")
 
             os.replace(tmp_path, file_path)
             return "done"
@@ -361,7 +380,8 @@ async def run(args, stats, stats_lock, cancel):
         except Exception as e:
             logger.warning(f"Ошибка парсинга прокси: {e}")
 
-    async with TelegramClient('tg_session', int(api_id), api_hash, **client_kwargs) as client:
+    session_path = os.path.join(_get_app_dir(), 'tg_session')
+    async with TelegramClient(session_path, int(api_id), api_hash, **client_kwargs) as client:
         if not await client.is_user_authorized():
             await authorize(client, phone)
 
@@ -472,6 +492,9 @@ def main():
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     args = parse_args()
+    # Если путь не задан явно — ищем .env рядом с exe/скриптом
+    if args.env == '.env':
+        args.env = os.path.join(_get_app_dir(), '.env')
     load_dotenv(args.env)
 
     cancel = threading.Event()
@@ -510,12 +533,13 @@ def main():
             sys.exit(1)
 
     print()
-    logger.info(
-        f"Завершено! Новых: {stats['done']}, "
-        f"Существует: {stats['exists']}, "
-        f"Пропущено: {stats['skipped']}, "
-        f"Ошибок: {stats['error']}"
-    )
+    with stats_lock:
+        logger.info(
+            f"Завершено! Новых: {stats['done']}, "
+            f"Существует: {stats['exists']}, "
+            f"Пропущено: {stats['skipped']}, "
+            f"Ошибок: {stats['error']}"
+        )
 
 
 if __name__ == '__main__':
