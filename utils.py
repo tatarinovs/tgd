@@ -1,3 +1,4 @@
+import logging
 from tqdm import tqdm
 
 
@@ -9,3 +10,18 @@ class TqdmStream:
 
     def flush(self):
         pass
+
+
+def setup_tqdm_logger(name, level=logging.INFO):
+    """
+    Настраивает глобальный логгер с использованием TqdmStream 
+    и перехватывает системные предупреждения (warnings),
+    чтобы они не дублировали прогресс-бары tqdm.
+    """
+    logging.basicConfig(
+        level=level,
+        format='%(levelname)s - %(message)s',
+        stream=TqdmStream()
+    )
+    logging.captureWarnings(True)
+    return logging.getLogger(name)

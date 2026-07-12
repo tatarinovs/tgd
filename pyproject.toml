@@ -28,7 +28,7 @@ fast = [
 # pip install tgd[verify] — проверка целостности медиафайлов
 verify = [
     "Pillow>=10.0",
-    "opencv-python>=4.8",
+    "av>=12.0",
 ]
 
 [project.scripts]

@@ -15,7 +15,7 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo
 )
 from tqdm import tqdm
-from utils import TqdmStream
+from utils import setup_tqdm_logger
 
 
 # ── Monkey-patch: ускорение AES-CTR для MTProxy ──────────────────────
@@ -71,12 +71,7 @@ except ImportError:
 # TqdmStream импортируется из utils.py
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(levelname)s - %(message)s',
-    stream=TqdmStream()
-)
-logger = logging.getLogger(__name__)
+logger = setup_tqdm_logger(__name__)
 
 # Убираем назойливые INFO логи от библиотек
 logging.getLogger('FastTelethonhelper').setLevel(logging.WARNING)
@@ -488,8 +483,11 @@ async def run(args, stats, stats_lock, cancel):
 
 
 def main():
-    if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # if os.name == 'nt':
+    #     import warnings
+    #     with warnings.catch_warnings():
+    #         warnings.simplefilter("ignore", DeprecationWarning)
+    #         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     args = parse_args()
     # Если путь не задан явно — ищем .env рядом с exe/скриптом
