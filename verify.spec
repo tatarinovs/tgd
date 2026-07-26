@@ -22,8 +22,8 @@ excludes = [
 ]
 
 a = Analysis(
-    ['verify.py'],
-    pathex=[],
+    ['src/verify.py'],
+    pathex=['src'],
     binaries=[],
     datas=[],
     hiddenimports=[
@@ -51,6 +51,10 @@ a = Analysis(
     noarchive=False,
     collect_all=['PIL', 'av'],
 )
+
+# Исключаем библиотеки api-ms-win-*, так как в Windows 10/11 они уже есть в системе.
+# Это позволит немного уменьшить размер итогового exe.
+a.binaries = [x for x in a.binaries if not x[0].startswith("api-ms-win-")]
 
 pyz = PYZ(a.pure)
 

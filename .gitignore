@@ -1,5 +1,5 @@
 .env
-*.session
+*.session*
 *.tmp
 *.bak
 *.exe
@@ -12,3 +12,5 @@ build/
 venv/
 .venv/
 *.egg-info/
+tgd-go/
+data/

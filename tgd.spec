@@ -32,8 +32,8 @@ excludes = [
 ]
 
 a = Analysis(
-    ['tgd.py'],
-    pathex=[_fth_dir] if _fth_dir else [],
+    ['src/tgd.py'],
+    pathex=['src'] + ([_fth_dir] if _fth_dir else []),
     binaries=[],
     datas=[],
     hiddenimports=[
@@ -44,6 +44,8 @@ a = Analysis(
         'python_socks',
         'TelethonFakeTLS',
         'utils',
+        'store',
+        'webui',
     ],
     hookspath=[],
     hooksconfig={},
