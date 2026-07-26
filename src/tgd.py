@@ -7,6 +7,7 @@ import sys
 import threading
 import glob
 import time
+import json
 from collections import Counter
 from dotenv import load_dotenv
 from telethon import TelegramClient
@@ -15,7 +16,8 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo
 )
 from tqdm import tqdm
-from utils import setup_tqdm_logger
+from utils import setup_tqdm_logger, ProcessResourceSampler
+from i18n import _, init_lang
 
 
 # ── Monkey-patch: ускорение AES-CTR для MTProxy ──────────────────────
@@ -65,6 +67,12 @@ try:
 except ImportError:
     HAS_FAST = False
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 
 
 
@@ -78,7 +86,7 @@ logging.getLogger('FastTelethonhelper').setLevel(logging.WARNING)
 logging.getLogger('telethon').setLevel(logging.ERROR)
 
 if not HAS_FAST:
-    logger.warning("FastTelethonhelper не найден — тяжёлые файлы будут качаться стандартным методом")
+    logger.warning(_("warn_fast_not_found"))
 
 
 def _get_app_dir() -> str:
@@ -235,13 +243,13 @@ async def download_task(client, message, file_name, is_heavy, output_dir, timeou
                 actual_size = 0
             expected_size = getattr(message.file, 'size', None)
             if not actual_size or (expected_size and actual_size < expected_size * 0.99):
-                raise ValueError(f"Неполная загрузка: {actual_size}/{expected_size} байт")
+                raise ValueError(_("err_incomplete_download", actual_size, expected_size))
 
             os.replace(tmp_path, file_path)
             return "done"
 
         except Exception as e:
-            logger.warning(f"[{file_name}] Попытка {attempt + 1}/{retries} не удалась: {e}")
+            logger.warning(_("warn_attempt_failed", file_name, attempt + 1, retries, e))
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
@@ -274,7 +282,7 @@ async def worker(queue, client, output_dir, timeout, retries, stats, stats_lock,
                 with stats_lock:
                     stats[result] += 1
         except Exception as e:
-            logger.error(f"Необработанная ошибка воркера: {e}")
+            logger.error(_("err_unhandled_worker", e))
             with stats_lock:
                 stats["error"] += 1
         finally:
@@ -290,13 +298,13 @@ async def authorize(client, phone):
     loop = asyncio.get_running_loop()
 
     await client.send_code_request(phone)
-    code = await loop.run_in_executor(None, lambda: input('Код подтверждения: ').strip())
+    code = await loop.run_in_executor(None, lambda: input(_("prompt_code")).strip())
 
     try:
         await client.sign_in(phone, code)
     except SessionPasswordNeededError:
         # Включён двухфакторный пароль (2FA)
-        password = await loop.run_in_executor(None, lambda: input('Пароль 2FA: ').strip())
+        password = await loop.run_in_executor(None, lambda: input(_("prompt_password")).strip())
         await client.sign_in(password=password)
 
 
@@ -329,19 +337,16 @@ def parse_proxy(p_url, client_kwargs):
             try:
                 from TelethonFakeTLS import ConnectionTcpMTProxyFakeTLS
                 client_kwargs['connection'] = ConnectionTcpMTProxyFakeTLS
-                logger.info(f"Используется MTProto FakeTLS прокси: {server}:{port}")
+                logger.info(_("info_mtproto_faketls", server, port))
             except ImportError:
-                logger.warning(
-                    "Секрет начинается с 'ee' (FakeTLS), но модуль TelethonFakeTLS не загружен. "
-                    "Подключение может не удаться."
-                )
+                logger.warning(_("warn_ee_secret_no_faketls"))
                 from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate
                 client_kwargs['connection'] = ConnectionTcpMTProxyRandomizedIntermediate
-                logger.info(f"Используется MTProto прокси: {server}:{port}")
+                logger.info(_("info_mtproto_proxy", server, port))
         else:
             from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate
             client_kwargs['connection'] = ConnectionTcpMTProxyRandomizedIntermediate
-            logger.info(f"Используется MTProto прокси: {server}:{port}")
+            logger.info(_("info_mtproto_proxy", server, port))
     else:
         import python_socks
         ptype = python_socks.ProxyType.SOCKS5 if parsed.scheme.startswith('socks') else python_socks.ProxyType.HTTP
@@ -350,7 +355,7 @@ def parse_proxy(p_url, client_kwargs):
             proxy_dict['username'] = parsed.username
             proxy_dict['password'] = parsed.password
         client_kwargs['proxy'] = proxy_dict
-        logger.info(f"Используется {parsed.scheme} прокси: {parsed.hostname}:{parsed.port}")
+        logger.info(_("info_socks_proxy", parsed.scheme, parsed.hostname, parsed.port))
 
 
 from store import GroupStore
@@ -376,16 +381,16 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
         group_input = int(group_input)
 
     entity = await client.get_entity(group_input)
-    logger.info(f"Старт: {getattr(entity, 'title', str(group_input))}")
+    logger.info(_("info_start", getattr(entity, 'title', str(group_input))))
 
     topic_id = None
     if topic_input:
         from telethon.tl.functions.channels import GetForumTopicsRequest
         try:
             topic_id = int(topic_input)
-            logger.info(f"Фильтрация по ID темы: {topic_id}")
+            logger.info(_("info_filter_topic", topic_id))
         except ValueError:
-            logger.info(f"Поиск темы с названием: '{topic_input}'...")
+            logger.info(_("info_search_topic", topic_input))
             try:
                 result = await client(GetForumTopicsRequest(
                     channel=entity,
@@ -402,12 +407,12 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
                             break
                 if matched_topic:
                     topic_id = matched_topic.id
-                    logger.info(f"Найдена тема '{matched_topic.title}' с ID: {topic_id}")
+                    logger.info(_("info_found_topic", matched_topic.title, topic_id))
                 else:
-                    logger.error(f"Тема '{topic_input}' не найдена!")
+                    logger.error(_("err_topic_not_found", topic_input))
                     return
             except Exception as e:
-                logger.error(f"Не удалось получить список тем: {e}")
+                logger.error(_("err_topic_list_fail", e))
                 return
 
     show_progress = not getattr(args, 'daemon', False)
@@ -425,11 +430,11 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
 
     heavy_workers = [
         asyncio.create_task(worker(heavy_queue, **worker_kwargs))
-        for _ in range(args.heavy_workers)
+        for _worker in range(args.heavy_workers)
     ]
     light_workers = [
         asyncio.create_task(worker(light_queue, **worker_kwargs))
-        for _ in range(args.workers)
+        for _worker in range(args.workers)
     ]
 
     iter_kwargs = {}
@@ -449,9 +454,9 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
             else:
                 await light_queue.put((message, file_name, is_heavy))
 
-    for _ in heavy_workers:
+    for _worker in heavy_workers:
         await heavy_queue.put(None)
-    for _ in light_workers:
+    for _worker in light_workers:
         await light_queue.put(None)
 
     await heavy_queue.join()
@@ -459,9 +464,6 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
 
     await asyncio.gather(*heavy_workers)
     await asyncio.gather(*light_workers)
-
-    import gc
-    gc.collect()
 
 
 async def run(args, stats, stats_lock, cancel):
@@ -478,11 +480,11 @@ async def run(args, stats, stats_lock, cancel):
     args.queue_size = args.queue_size if args.queue_size is not None else int(os.getenv('QUEUE_SIZE', 50))
 
     if not all([api_id, api_hash, phone]):
-        logger.error("Ошибка: не заданы APP_API_ID, APP_API_HASH или PHONE_NUMBER в .env")
-        logger.info(f"Заполните файл {os.path.join(_get_app_dir(), '.env')} и запустите программу снова.")
+        logger.error(_("err_env_missing"))
+        logger.info(_("info_fill_env", os.path.join(_get_app_dir(), '.env')))
         if sys.stdin and sys.stdin.isatty():
             try:
-                input("\nНажмите Enter для выхода...")
+                input(_("prompt_exit"))
             except (KeyboardInterrupt, EOFError):
                 pass
         return
@@ -490,10 +492,10 @@ async def run(args, stats, stats_lock, cancel):
     if not args.group_id:
         if sys.stdin and sys.stdin.isatty():
             try:
-                print("\n=== Интерактивный режим TGD ===")
-                g_in = input("Введите ID группы/канала, @username или ссылку: ").strip()
+                print(_("ui_interactive_title"))
+                g_in = input(_("prompt_group")).strip()
                 if not g_in:
-                    logger.error("Группа не указана. Завершение работы.")
+                    logger.error(_("err_no_group"))
                     return
                 args.group_id = g_in
                 
@@ -501,12 +503,12 @@ async def run(args, stats, stats_lock, cancel):
                     clean_name = str(args.group_id).rstrip('/').split('/')[-1].lstrip('@')
                     default_base_dir = os.getenv('DEFAULT_DOWNLOAD_DIR', 'downloads')
                     default_out = os.path.join(default_base_dir, clean_name)
-                    out_in = input(f"Папка сохранения [{default_out}]: ").strip()
+                    out_in = input(_("prompt_output_dir", default_out)).strip()
                     args.output_dir = out_in if out_in else default_out
             except (KeyboardInterrupt, EOFError):
                 return
         else:
-            logger.error("Ошибка: не указаны group_id или output_dir. Используйте -d для веб-интерфейса.")
+            logger.error(_("err_args_missing"))
             return
 
     if not args.output_dir:
@@ -520,7 +522,7 @@ async def run(args, stats, stats_lock, cancel):
         try:
             parse_proxy(p_url, client_kwargs)
         except Exception as e:
-            logger.warning(f"Ошибка парсинга прокси: {e}")
+            logger.warning(_("warn_proxy_parse", e))
 
     session_path = os.path.join(_get_app_dir(), 'tg_session')
     async with TelegramClient(session_path, int(api_id), api_hash, **client_kwargs) as client:
@@ -544,7 +546,7 @@ async def run_daemon(args, cancel):
     args.queue_size = args.queue_size if args.queue_size is not None else int(os.getenv('QUEUE_SIZE', 50))
 
     if not all([api_id, api_hash, phone]):
-        logger.error("Ошибка: не заданы APP_API_ID, APP_API_HASH или PHONE_NUMBER в .env")
+        logger.error(_("err_env_missing"))
         return
 
     data_dir = args.data or _get_app_dir()
@@ -558,7 +560,7 @@ async def run_daemon(args, cancel):
         try:
             parse_proxy(p_url, client_kwargs)
         except Exception as e:
-            logger.warning(f"Ошибка парсинга прокси: {e}")
+            logger.warning(_("warn_proxy_parse", e))
 
     session_path = os.path.join(data_dir, 'tg_session')
     loop = asyncio.get_running_loop()
@@ -595,9 +597,9 @@ async def run_daemon(args, cancel):
                     except Exception:
                         pass
             store.add(group_input, title, topic_title, res_id)
-            logger.info(f"[WebUI] Добавлена группа: {title} ({group_input})")
+            logger.info(_("webui_added_group", title, group_input))
         except Exception as e:
-            logger.error(f"[WebUI] Ошибка добавления группы {group_input}: {e}")
+            logger.error(_("webui_err_add_group", group_input, e))
             store.add(group_input, group_input, topic_input)
 
     active_cancels = {}
@@ -605,19 +607,20 @@ async def run_daemon(args, cancel):
     async def trigger_download(group_id, topic):
         task_key = f"{group_id}|{topic}"
         if active_tasks.get(task_key):
-            logger.info(f"[WebUI] Задача {task_key} уже выполняется.")
+            logger.info(_("webui_task_running", group_id, topic))
             return
 
         job_cancel = threading.Event()
         active_cancels[task_key] = job_cancel
         active_tasks[task_key] = True
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        store.update_stats(group_id, topic, status="Скачивание...", stats="Подготовка...", last_error="", last_run=ts)
-        web_server.broadcast_task_update(group_id, topic, "Скачивание...", "Подготовка...", "", ts)
+        import json
+        store.update_stats(group_id, topic, status="downloading", stats=json.dumps({"text_key": "preparing"}), last_error="", last_run=ts)
+        web_server.broadcast_task_update(group_id, topic, "downloading", json.dumps({"text_key": "preparing"}), "", ts)
 
         async def _download_job():
             try:
-                g_item = next((g for g in store.list() if str(g.get('id')) == str(group_id) and str(g.get('topic', '')) == str(topic)), None)
+                g_item = store.get(group_id, topic)
                 folder_name = sanitize_filename(g_item.get('title', str(group_id)) if g_item else str(group_id))
                 default_base_dir = os.getenv('DEFAULT_DOWNLOAD_DIR', 'downloads')
                 output_dir = os.path.join(data_dir, default_base_dir, folder_name)
@@ -649,14 +652,13 @@ async def run_daemon(args, cancel):
                             last_t = now
 
                             if job_cancel.is_set():
-                                cur_status = "Остановка..."
-                                speed_txt = f" [{speed:.1f} MB/s]" if speed > 0.05 else ""
-                                st_text = f"Ждём завершения текущих загрузок... (Новых: {d}, Было: {ex}){speed_txt}"
+                                cur_status = "stopping"
+                                stats_data = {"text_key": "waiting_stop", "new": d, "exists": ex, "speed": speed}
                             else:
-                                cur_status = "Скачивание..."
-                                speed_txt = f" [{speed:.1f} MB/s]" if speed > 0.05 else ""
-                                st_text = f"Новых: {d}, Было: {ex}, Пропущено: {sk}, Ошибок: {err}{speed_txt}"
+                                cur_status = "downloading"
+                                stats_data = {"new": d, "exists": ex, "skipped": sk, "error": err, "speed": speed}
 
+                            st_text = json.dumps(stats_data)
                             store.update_stats(group_id, topic, status=cur_status, stats=st_text)
                             web_server.broadcast_task_update(group_id, topic, cur_status, st_text)
 
@@ -669,28 +671,27 @@ async def run_daemon(args, cancel):
                     broadcaster_task.cancel()
 
                 with stats_lock:
-                    res_str = f"Новых: {stats['done']}, Существует: {stats['exists']}, Пропущено: {stats['skipped']}, Ошибок: {stats['error']}"
-                    err_str = f"Ошибок: {stats['error']}" if stats['error'] > 0 else ""
+                    stats_data = {"new": stats['done'], "exists": stats['exists'], "skipped": stats['skipped'], "error": stats['error']}
+                    err_str = _("err_errors_count", stats['error']) if stats['error'] > 0 else ""
 
                 if job_cancel.is_set():
                     await asyncio.sleep(1.0)
-                    status_str = "Отменено"
-                    res_str += " (Остановлено)"
+                    status_str = "cancelled"
+                    stats_data["text_key"] = "stopped"
                 else:
-                    status_str = "Завершено" if stats['error'] == 0 else "Завершено с ошибками"
+                    status_str = "done" if stats['error'] == 0 else "done_errors"
 
+                res_str = json.dumps(stats_data)
                 store.update_stats(group_id, topic, status=status_str, stats=res_str, last_error=err_str, persist=True)
                 web_server.broadcast_task_update(group_id, topic, status_str, res_str, err_str)
             except Exception as e:
-                logger.error(f"[WebUI] Ошибка скачивания {group_id}: {e}")
+                logger.error(_("webui_err_download", group_id, e))
                 err_msg = str(e)
-                store.update_stats(group_id, topic, status="Ошибка", stats="", last_error=err_msg, persist=True)
-                web_server.broadcast_task_update(group_id, topic, "Ошибка", "", err_msg)
+                store.update_stats(group_id, topic, status="error", stats="", last_error=err_msg, persist=True)
+                web_server.broadcast_task_update(group_id, topic, "error", "", err_msg)
             finally:
                 active_cancels.pop(task_key, None)
                 active_tasks.pop(task_key, None)
-                import gc
-                gc.collect()
 
         asyncio.create_task(_download_job())
 
@@ -698,25 +699,89 @@ async def run_daemon(args, cancel):
         task_key = f"{group_id}|{topic}"
         job_cancel = active_cancels.get(task_key)
         if job_cancel:
-            logger.info(f"[WebUI] Отмена задачи {task_key}...")
+            logger.info(_("webui_task_cancel", group_id, topic))
             job_cancel.set()
-            store.update_stats(group_id, topic, status="Остановка...", stats="Ждём завершения текущих загрузок...", last_error="")
-            web_server.broadcast_task_update(group_id, topic, "Остановка...", "Ждём завершения текущих загрузок...")
+            store.update_stats(group_id, topic, status="stopping", stats=json.dumps({"text_key": "waiting_stop"}), last_error="")
+            web_server.broadcast_task_update(group_id, topic, "stopping", json.dumps({"text_key": "waiting_stop"}))
+
+    async def restart_daemon():
+        logger.info(_("info_restart_requested"))
+
+        async def _do_restart():
+            # Небольшая пауза, чтобы успел уйти HTTP-редирект пользователю
+            await asyncio.sleep(0.3)
+            try:
+                web_server.stop()
+            except Exception:
+                pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            # Используем subprocess.Popen + os._exit, чтобы избежать гонки (race condition) 
+            # с очисткой папки _MEIPASS в Windows при использовании os.execv в PyInstaller.
+            import subprocess
+            env = os.environ.copy()
+            if getattr(sys, 'frozen', False):
+                env.pop('_MEIPASS2', None)
+                cmd = [sys.executable] + sys.argv[1:]
+            else:
+                cmd = [sys.executable] + sys.argv
+            subprocess.Popen(cmd, env=env)
+            os._exit(0)
+
+        asyncio.create_task(_do_restart())
+
+    async def _resource_monitor():
+        """Раз в несколько секунд шлёт в тот же SSE-канал метрики ТОЛЬКО этого
+        процесса (не всей системы). Ничего не считает, если на дашборд никто
+        не смотрит. Источник метрик: psutil, если он установлен, иначе —
+        встроенный сэмплер на /proc (см. utils.ProcessResourceSampler),
+        который не требует сторонних пакетов и работает на любом Linux,
+        включая NAS без доступа к pip."""
+        proc = psutil.Process(os.getpid()) if HAS_PSUTIL else None
+        sampler = None if HAS_PSUTIL else ProcessResourceSampler()
+        if proc:
+            proc.cpu_percent(interval=None)  # прайминг — первый вызов всегда вернёт 0.0
+        else:
+            sampler.sample()  # прайминг — то же самое: первая точка отсчёта для delta по CPU-времени
+        started_at = time.time()
+        while True:
+            await asyncio.sleep(5.0)
+            if not web_server.broadcaster._listeners:
+                continue
+            try:
+                if proc:
+                    cpu = proc.cpu_percent(interval=None)
+                    rss_mb = proc.memory_info().rss / (1024 * 1024)
+                else:
+                    cpu, rss_mb = sampler.sample()
+            except Exception:
+                cpu = rss_mb = None
+            web_server.broadcast_resource({
+                "cpu": cpu,
+                "rss_mb": rss_mb,
+                "threads": threading.active_count(),
+                "active_jobs": len(active_tasks),
+                "uptime": int(time.time() - started_at),
+            })
 
     daemon_callbacks = {
         'resolve_and_add': resolve_and_add,
         'trigger_download': trigger_download,
-        'cancel_download': cancel_download
+        'cancel_download': cancel_download,
+        'restart': restart_daemon,
     }
 
     host, port_str = args.addr.split(':') if ':' in args.addr else ('127.0.0.1', args.addr)
     web_server = WebUIServer(host, int(port_str), store, loop, daemon_callbacks)
     web_server.start()
+    resource_task = asyncio.create_task(_resource_monitor())
 
-    logger.info(f"TGD Daemon запущен на http://{host}:{port_str}")
+    logger.info(_("info_daemon_started", host, port_str))
     try:
         while not cancel.is_set():
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(3600)
     finally:
         web_server.stop()
         pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
@@ -761,6 +826,7 @@ def ensure_env_file(env_path: str):
 
 
 def main():
+    init_lang()
     args = parse_args()
     if args.env == '.env':
         args.env = os.path.join(_get_app_dir(), '.env')
@@ -781,7 +847,7 @@ def main():
             else:
                 loop.run_until_complete(run(args, stats, stats_lock, cancel))
         except Exception as e:
-            logger.error(f"Критическая ошибка: {e}")
+            logger.error(_("err_critical", e))
         finally:
             try:
                 pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
@@ -798,9 +864,14 @@ def main():
     thread.start()
 
     try:
-        while not done.wait(timeout=0.2):
-            pass
+        if args.daemon:
+            done.wait()
+        else:
+            while not done.wait(timeout=0.2):
+                pass
     except KeyboardInterrupt:
+        if args.daemon:
+            sys.exit(1)
         sys.stderr.write("\r\033[K\033[33m[СТОП] Завершаем текущие процессы... (повторный Ctrl+C — прервать немедленно)\033[0m\n")
         sys.stderr.flush()
         cancel.set()

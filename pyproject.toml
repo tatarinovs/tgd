@@ -12,9 +12,9 @@ authors = [
     { name = "User" }
 ]
 dependencies = [
-    "telethon==1.41.2",
-    "python-dotenv==1.0.1",
-    "tqdm==4.67.1",
+    "telethon>=1.41.2",
+    "python-dotenv>=1.0.1",
+    "tqdm>=4.67.1",
     "python-socks[asyncio]>=2.4.4",
 ]
 

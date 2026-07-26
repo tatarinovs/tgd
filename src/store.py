@@ -22,8 +22,8 @@ class GroupStore:
                 needs_save = False
                 for g in self._groups:
                     st = g.get('status', '')
-                    if "Скачивание" in st or "Остановка" in st:
-                        g['status'] = "Прервано"
+                    if "Скачивание" in st or "Остановка" in st or st in ("downloading", "stopping"):
+                        g['status'] = "cancelled"
                         needs_save = True
                 if needs_save:
                     self._save_unlocked()
@@ -38,8 +38,8 @@ class GroupStore:
             clean_groups = []
             for g in self._groups:
                 st = g.get('status', '')
-                if "Скачивание" in st or "Остановка" in st:
-                    st = "Прервано"
+                if "Скачивание" in st or "Остановка" in st or st in ("downloading", "stopping"):
+                    st = "cancelled"
                 clean_groups.append({
                     'id': str(g.get('id', '')),
                     'title': g.get('title', ''),
@@ -68,6 +68,13 @@ class GroupStore:
         with self._lock:
             # Return deep copy of items
             return [dict(g) for g in self._groups]
+
+    def get(self, group_id: str, topic: str = "") -> Optional[Dict[str, Any]]:
+        with self._lock:
+            for g in self._groups:
+                if str(g.get('id')) == str(group_id) and str(g.get('topic', '')) == str(topic):
+                    return dict(g)
+            return None
 
     def add(self, group_id: str, title: str, topic: str = "", resolved_id: int = 0) -> bool:
         with self._lock:

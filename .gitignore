@@ -5,6 +5,8 @@
 *.exe
 *.bat
 *.cmd
+*.zip
+*.json
 rename_old_files.py
 __pycache__/
 dist/
@@ -14,3 +16,4 @@ venv/
 *.egg-info/
 tgd-go/
 data/
+downloads/
