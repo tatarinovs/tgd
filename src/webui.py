@@ -49,8 +49,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     margin: 0 auto;
     line-height: 1.5;
   }
-  h1 { font-size: 1.75rem; margin-bottom: 20px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
-  .badge-daemon { font-size: 0.75rem; background: rgba(56, 189, 248, 0.15); color: var(--primary); padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(56, 189, 248, 0.3); }
+  h1 { font-size: 1.75rem; margin-bottom: 20px; font-weight: 700; color: #fff; display: flex; align-items: flex-start; gap: 10px; line-height: 1; }
+  .badge-daemon { font-size: 0.75rem; background: rgba(56, 189, 248, 0.15); color: var(--primary); padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(56, 189, 248, 0.3); line-height: 1; }
   .card {
     background: var(--card-bg);
     border: 1px solid var(--border);
@@ -111,7 +111,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .status-done { background: rgba(34, 197, 94, 0.15); color: var(--success); border: 1px solid rgba(34, 197, 94, 0.3); }
   .status-error, .status-done_errors, .status-cancelled { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
 
-  .stats-text { font-size: 0.88rem; color: #38bdf8; margin-top: 4px; font-weight: 500; }
+  .stats-text { font-size: 0.88rem; color: #38bdf8; margin-top: 4px; font-weight: 500; font-variant-numeric: tabular-nums; }
   .error-text { font-size: 0.88rem; color: var(--danger); margin-top: 4px; }
   .last-run { font-size: 0.78rem; color: var(--text-muted); margin-top: 4px; }
   .hidden { display: none !important; }
@@ -276,6 +276,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.querySelectorAll(".btn-stop").forEach(el => el.innerText = _t("btn_stop"));
     document.querySelectorAll(".btn-delete").forEach(el => el.innerText = _t("btn_delete"));
   });
+
+  async function submitAsync(e, form, isRemove) {
+    e.preventDefault();
+    try {
+      let formData = new FormData(form);
+      let params = new URLSearchParams(formData);
+      await fetch(form.action, { method: 'POST', body: params });
+      if (isRemove) {
+        let item = form.closest('.group-item');
+        if (item) item.remove();
+      }
+    } catch (err) {
+      console.error("Action error:", err);
+    }
+  }
 </script>
 </head>
 <body>
@@ -416,6 +431,15 @@ class SSEBroadcaster:
     def __init__(self):
         self._listeners = []
         self._lock = threading.Lock()
+        self.loop = None
+        self.listeners_event = None
+
+    def set_listeners_event(self, loop, event):
+        with self._lock:
+            self.loop = loop
+            self.listeners_event = event
+            if self._listeners and self.loop and self.listeners_event:
+                self.loop.call_soon_threadsafe(self.listeners_event.set)
 
     def subscribe(self, max_listeners: int = 0):
         """Возвращает очередь событий или None, если лимит слушателей исчерпан."""
@@ -423,7 +447,10 @@ class SSEBroadcaster:
         with self._lock:
             if max_listeners and len(self._listeners) >= max_listeners:
                 return None
+            was_empty = (len(self._listeners) == 0)
             self._listeners.append(q)
+            if was_empty and self.loop and self.listeners_event:
+                self.loop.call_soon_threadsafe(self.listeners_event.set)
         return q
 
     def has_listeners(self) -> bool:
@@ -434,6 +461,8 @@ class SSEBroadcaster:
         with self._lock:
             if q in self._listeners:
                 self._listeners.remove(q)
+                if not self._listeners and self.loop and self.listeners_event:
+                    self.loop.call_soon_threadsafe(self.listeners_event.clear)
 
     def broadcast(self, data: dict):
         with self._lock:
@@ -558,7 +587,7 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks, auth_token=
                 self.send_error(404, "Not Found")
 
         def handle_index(self):
-            groups = store.list()
+            groups = list(reversed(store.list()))
             groups_html = ""
             if not groups:
                 groups_html = "<p style='color: var(--text-muted);' data-i18n=\"no_groups\">Нет добавленных групп.</p>"
@@ -600,12 +629,12 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks, auth_token=
                           <span class="group-meta">({gid}<span class="topic-meta"{topic_meta_attr}>{topic_meta}</span>)</span>
                         </div>
                         <div>
-                          <form action="{action_url}" method="POST" style="display:inline;" class="action-form">
+                          <form action="{action_url}" method="POST" style="display:inline;" class="action-form" onsubmit="submitAsync(event, this)">
                             <input type="hidden" name="id" value="{gid}">
                             <input type="hidden" name="topic" value="{topic}">
                             <button type="submit" class="{btn_class} {btn_action_class}">{btn_text}</button>
                           </form>
-                          <form action="/remove" method="POST" style="display:inline;">
+                          <form action="/remove" method="POST" style="display:inline;" onsubmit="submitAsync(event, this, true)">
                             <input type="hidden" name="id" value="{gid}">
                             <input type="hidden" name="topic" value="{topic}">
                             <button type="submit" class="btn-danger btn-delete">Удалить</button>
@@ -740,13 +769,21 @@ class WebUIServer:
         handler_cls = make_request_handler(
             self.store, self.broadcaster, self.loop, self.daemon_callbacks, auth_token
         )
-        # Может бросить OSError (порт занят) — вызывающий код обязан это поймать
+        # Снижаем размер стека потоков WebUI (с 8 МБ по умолчанию на Linux до 512 КБ)
+        try:
+            threading.stack_size(512 * 1024)
+        except Exception:
+            pass
+
         self.httpd = ThreadedHTTPServer((self.host, self.port), handler_cls)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self._stopped = False
 
     def has_listeners(self) -> bool:
         return self.broadcaster.has_listeners()
+
+    def set_listeners_event(self, loop, event):
+        self.broadcaster.set_listeners_event(loop, event)
 
     def start(self):
         self.thread.start()

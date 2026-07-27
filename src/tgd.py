@@ -928,6 +928,14 @@ async def run_daemon(args, cancel):
             finally:
                 active_cancels.pop(task_key, None)
                 active_tasks.pop(task_key, None)
+                import gc
+                gc.collect()
+                if sys.platform.startswith('linux'):
+                    try:
+                        import ctypes
+                        ctypes.CDLL('libc.so.6').malloc_trim(0)
+                    except Exception:
+                        pass
 
         spawn(_download_job())
 
@@ -968,41 +976,51 @@ async def run_daemon(args, cancel):
 
         spawn(_do_restart())
 
+    listeners_event = asyncio.Event()
+
     async def _resource_monitor():
-        """Раз в несколько секунд шлёт в тот же SSE-канал метрики ТОЛЬКО этого
-        процесса (не всей системы). Ничего не считает, если на дашборд никто
-        не смотрит. Источник метрик: psutil, если он установлен, иначе —
-        встроенный сэмплер на /proc (см. utils.ProcessResourceSampler),
-        который не требует сторонних пакетов и работает на любом Linux,
-        включая NAS без доступа к pip."""
+        """Раз в 5 секунд шлёт в SSE-канал метрики процесса, ТОЛЬКО когда открыт WebUI.
+        Если на дашборд никто не смотрит, спит на asyncio.Event без фоновых просыпаний."""
         proc = psutil.Process(os.getpid()) if HAS_PSUTIL else None
         sampler = None if HAS_PSUTIL else ProcessResourceSampler()
         if not HAS_PSUTIL:
             logger.info(_("warn_psutil_not_found"))
-        if proc:
-            proc.cpu_percent(interval=None)  # прайминг — первый вызов всегда вернёт 0.0
-        else:
-            sampler.sample()  # прайминг — то же самое: первая точка отсчёта для delta по CPU-времени
         started_at = time.time()
         while True:
-            await asyncio.sleep(5.0)
-            if not web_server.has_listeners():
-                continue
+            # 1. Засыпаем бессрочно на событии (0 просыпаний), пока никто не открыл WebUI
+            await listeners_event.wait()
+
+            # 2. Пользователь только что открыл вкладку: прайминг для точной точки отсчёта
             try:
                 if proc:
-                    cpu = proc.cpu_percent(interval=None)
-                    rss_mb = proc.memory_info().rss / (1024 * 1024)
+                    proc.cpu_percent(interval=None)
                 else:
-                    cpu, rss_mb = sampler.sample()
+                    sampler.sample()
             except Exception:
-                cpu = rss_mb = None
-            web_server.broadcast_resource({
-                "cpu": cpu,
-                "rss_mb": rss_mb,
-                "threads": threading.active_count(),
-                "active_jobs": len(active_tasks),
-                "uptime": int(time.time() - started_at),
-            })
+                pass
+
+            # 3. Пока вкладка открыта — собираем и шлём обновления каждые 5 секунд
+            while listeners_event.is_set():
+                await asyncio.sleep(5.0)
+                if not listeners_event.is_set():
+                    break
+
+                try:
+                    if proc:
+                        cpu = proc.cpu_percent(interval=None)
+                        rss_mb = proc.memory_info().rss / (1024 * 1024)
+                    else:
+                        cpu, rss_mb = sampler.sample()
+                except Exception:
+                    cpu = rss_mb = None
+
+                web_server.broadcast_resource({
+                    "cpu": cpu,
+                    "rss_mb": rss_mb,
+                    "threads": threading.active_count(),
+                    "active_jobs": len(active_tasks),
+                    "uptime": int(time.time() - started_at),
+                })
 
     daemon_callbacks = {
         'resolve_and_add': resolve_and_add,
@@ -1036,13 +1054,18 @@ async def run_daemon(args, cancel):
         if not await client.is_user_authorized():
             await authorize(client, phone)
 
+        web_server.set_listeners_event(loop, listeners_event)
         web_server.start()
         spawn(_resource_monitor())
 
+        shutdown_event = asyncio.Event()
+
         # SIGTERM от systemd / docker stop / NAS раньше просто убивал процесс
-        def _request_stop(signum):
-            logger.info(_("info_signal_shutdown", signum))
+        def _request_stop(signum=None):
+            if signum is not None:
+                logger.info(_("info_signal_shutdown", signum))
             cancel.set()
+            shutdown_event.set()
             for job_cancel in list(active_cancels.values()):
                 job_cancel.set()
 
@@ -1058,7 +1081,10 @@ async def run_daemon(args, cancel):
 
         logger.info(_("info_daemon_started", host, port))
         while not cancel.is_set():
-            await asyncio.sleep(1.0)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
 
         # Даём активным загрузкам корректно закрыть текущие файлы
         for job_cancel in list(active_cancels.values()):
@@ -1164,14 +1190,14 @@ def main():
     # Ctrl+C ловится одинаково в обоих режимах: демон раньше просто убивался
     # через sys.exit(1), не закрывая ни соединение, ни текущие файлы.
     try:
-        while not done.wait(timeout=0.2):
+        while not done.wait(timeout=1.0):
             pass
     except KeyboardInterrupt:
         sys.stderr.write(f"\r\033[K\033[33m{_('stop_graceful')}\033[0m\n")
         sys.stderr.flush()
         cancel.set()
         try:
-            while not done.wait(timeout=0.2):
+            while not done.wait(timeout=1.0):
                 pass
         except KeyboardInterrupt:
             sys.stderr.write(f"\r\033[K\033[1;31m{_('stop_forced')}\033[0m\n")
