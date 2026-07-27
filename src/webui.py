@@ -1,6 +1,8 @@
 import os
+import sys
 import json
-import time
+import hmac
+import base64
 import queue
 import threading
 import asyncio
@@ -8,6 +10,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 from html import escape
+
+# Тело POST у веб-морды — это две короткие формы; всё крупнее читать незачем
+MAX_BODY_BYTES = 64 * 1024
+# Каждое SSE-соединение держит поток, поэтому их количество ограничено
+MAX_SSE_LISTENERS = 32
+# Пауза между heartbeat: на ней же детектируется отвалившийся браузер
+SSE_HEARTBEAT_SEC = 15.0
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -188,6 +197,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     return I18N[currentLang][key] || key;
   }
 
+  // Заменяет ВСЕ вхождения каждого плейсхолдера
+  function fillAll(tpl, values) {
+    for (var placeholder in values) {
+      tpl = tpl.split(placeholder).join(values[placeholder]);
+    }
+    return tpl;
+  }
+
   function parseStats(statsRaw, status) {
     if (!statsRaw) return "";
     try {
@@ -206,12 +223,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (data.speed > 0.05) {
         speed_txt = " [" + data.speed.toFixed(1) + " MB/s]";
       }
+      // Глобальная замена через split/join: replace() со строковым аргументом
+      // менял только первое вхождение, и повторный плейсхолдер тихо оставался
+      // бы в тексте (регэксп здесь не используем — шаблон лежит в Python-строке).
       let tpl = _t(textKey);
-      return tpl.replace("{new}", data.new || 0)
-                .replace("{exists}", data.exists || 0)
-                .replace("{skipped}", data.skipped || 0)
-                .replace("{error}", data.error || 0)
-                .replace("{speed_txt}", speed_txt);
+      return fillAll(tpl, {
+        "{new}": data.new || 0,
+        "{exists}": data.exists || 0,
+        "{skipped}": data.skipped || 0,
+        "{error}": data.error || 0,
+        "{speed_txt}": speed_txt
+      });
     } catch (e) {
       return statsRaw; // fallback to raw string (old groups.json)
     }
@@ -302,18 +324,25 @@ if (!!window.EventSource) {
         var cpuStr = (data.cpu === null || data.cpu === undefined) ? "N/A" : data.cpu.toFixed(1) + "%";
         var rssStr = (data.rss_mb === null || data.rss_mb === undefined) ? "N/A" : data.rss_mb.toFixed(1);
 
-        line.innerText = _t("resource_line")
-          .replace("{cpu}", cpuStr)
-          .replace("{rss}", rssStr)
-          .replace("{threads}", data.threads)
-          .replace("{jobs}", data.active_jobs)
-          .replace("{uptime}", uptimeStr);
+        line.innerText = fillAll(_t("resource_line"), {
+          "{cpu}": cpuStr,
+          "{rss}": rssStr,
+          "{threads}": data.threads,
+          "{jobs}": data.active_jobs,
+          "{uptime}": uptimeStr
+        });
       }
       return;
     }
     if (data.type === "task") {
-      var idStr = "group-" + data.id + "-" + (data.topic || "");
-      var groupDiv = document.getElementById(idStr);
+      // Ищем по data-key, а не по id элемента: id склеивался из group_id и темы
+      // и разъезжался с серверным вариантом на любых спецсимволах в названии.
+      var key = data.id + "|" + (data.topic || "");
+      var groupDiv = null;
+      var items = document.querySelectorAll(".group-item");
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].getAttribute("data-key") === key) { groupDiv = items[i]; break; }
+      }
       if (groupDiv) {
         var statusBadge = groupDiv.querySelector(".status-badge");
         if (data.status) {
@@ -388,11 +417,18 @@ class SSEBroadcaster:
         self._listeners = []
         self._lock = threading.Lock()
 
-    def subscribe(self) -> queue.Queue:
+    def subscribe(self, max_listeners: int = 0):
+        """Возвращает очередь событий или None, если лимит слушателей исчерпан."""
         q = queue.Queue(maxsize=100)
         with self._lock:
+            if max_listeners and len(self._listeners) >= max_listeners:
+                return None
             self._listeners.append(q)
         return q
+
+    def has_listeners(self) -> bool:
+        with self._lock:
+            return bool(self._listeners)
 
     def unsubscribe(self, q: queue.Queue):
         with self._lock:
@@ -416,9 +452,19 @@ class SSEBroadcaster:
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        """Браузер, закрывший вкладку (или оборванный SSE), — это норма, а не
+        повод сыпать трейсбеком в лог демона."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
-def make_request_handler(store, broadcaster, loop, daemon_callbacks):
+
+def make_request_handler(store, broadcaster, loop, daemon_callbacks, auth_token=None):
     class WebUIHandler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
         def log_message(self, format, *args):
             # Suppress default request logging to avoid stdout clutter
             pass
@@ -426,9 +472,53 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks):
         def _send_redirect(self, path='/'):
             self.send_response(303)
             self.send_header('Location', path)
+            self.send_header('Content-Length', '0')
             self.end_headers()
 
+        def _send_plain(self, code, text=''):
+            body = text.encode('utf-8')
+            if code >= 400:
+                # Тело запроса мы не дочитали — переиспользовать соединение нельзя
+                self.close_connection = True
+            self.send_response(code)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        # ── доступ ───────────────────────────────────────────────────
+        def _authorized(self) -> bool:
+            """HTTP Basic, если в .env заданы WEBUI_USER/WEBUI_PASS."""
+            if not auth_token:
+                return True
+            header = self.headers.get('Authorization', '')
+            if not header.startswith('Basic '):
+                return False
+            return hmac.compare_digest(header[6:].strip(), auth_token)
+
+        def _demand_auth(self):
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="TGD"')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def _same_origin(self) -> bool:
+            """Защита от CSRF: сторонняя страница не должна дёргать /download,
+            /remove и /restart из браузера пользователя."""
+            host = (self.headers.get('Host') or '').strip()
+            for header in ('Origin', 'Referer'):
+                value = self.headers.get(header)
+                if not value:
+                    continue
+                netloc = urlparse(value).netloc
+                return bool(netloc) and netloc == host
+            # Ни Origin, ни Referer — это не браузерная форма (curl, скрипт)
+            return True
+
         def do_GET(self):
+            if not self._authorized():
+                return self._demand_auth()
             parsed = urlparse(self.path)
             if parsed.path == '/':
                 self.handle_index()
@@ -438,9 +528,20 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks):
                 self.send_error(404, "Not Found")
 
         def do_POST(self):
+            if not self._authorized():
+                return self._demand_auth()
+            if not self._same_origin():
+                return self._send_plain(403, "Cross-origin request rejected")
+
             parsed = urlparse(self.path)
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+            try:
+                length = int(self.headers.get('Content-Length', 0) or 0)
+            except (TypeError, ValueError):
+                return self._send_plain(400, "Bad Content-Length")
+            if length < 0 or length > MAX_BODY_BYTES:
+                return self._send_plain(413, "Payload too large")
+
+            body = self.rfile.read(length).decode('utf-8', 'replace') if length > 0 else ''
             form_data = parse_qs(body)
 
             if parsed.path == '/add':
@@ -471,7 +572,7 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks):
                     error = escape(str(g.get('last_error', '')))
                     last_run = escape(str(g.get('last_run', '')))
 
-                    id_attr = f"group-{gid}-{topic}"
+                    key_attr = escape(f"{g.get('id', '')}|{g.get('topic', '')}")
                     topic_meta_attr = f' data-topic="{topic}" data-gid="{gid}"' if topic else ''
                     topic_meta = f", тема: {topic}" if topic else ""
                     
@@ -492,7 +593,7 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks):
                     btn_action_class = "btn-stop" if is_running else "btn-start"
 
                     groups_html += f"""
-                    <div class="group-item" id="{id_attr}">
+                    <div class="group-item" data-key="{key_attr}">
                       <div class="group-header">
                         <div>
                           <span class="group-title">{title}</span>
@@ -520,11 +621,12 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks):
                     </div>
                     """
 
-            html = HTML_TEMPLATE.replace("{GROUPS_HTML}", groups_html)
+            html = HTML_TEMPLATE.replace("{GROUPS_HTML}", groups_html).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html)))
             self.end_headers()
-            self.wfile.write(html.encode('utf-8'))
+            self.wfile.write(html)
 
         def handle_add(self, form_data):
             group_input = form_data.get('group', [''])[0].strip()
@@ -586,19 +688,24 @@ def make_request_handler(store, broadcaster, loop, daemon_callbacks):
             self._send_redirect('/')
 
         def handle_sse(self):
+            q = broadcaster.subscribe(MAX_SSE_LISTENERS)
+            if q is None:
+                # Каждое соединение держит поток — лучше отказать, чем копить их
+                return self._send_plain(503, "Too many event listeners")
+
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'keep-alive')
-            self.send_header('Access-Control-Allow-Origin', '*')
+            # Раньше здесь стоял Access-Control-Allow-Origin: *, и любой сайт мог
+            # читать поток событий демона из браузера пользователя.
+            self.send_header('Connection', 'close')
             self.end_headers()
             self.close_connection = True
 
-            q = broadcaster.subscribe()
             try:
                 while True:
                     try:
-                        msg = q.get(timeout=30.0)
+                        msg = q.get(timeout=SSE_HEARTBEAT_SEC)
                     except queue.Empty:
                         msg = ": heartbeat\n\n"
                     self.wfile.write(msg.encode('utf-8'))
@@ -621,18 +728,39 @@ class WebUIServer:
         self.loop = loop
         self.broadcaster = SSEBroadcaster()
         self.daemon_callbacks = daemon_callbacks
-        
-        handler_cls = make_request_handler(self.store, self.broadcaster, self.loop, self.daemon_callbacks)
+
+        user = os.getenv('WEBUI_USER', '').strip()
+        password = os.getenv('WEBUI_PASS', '')
+        self.auth_enabled = bool(user and password)
+        auth_token = (
+            base64.b64encode(f"{user}:{password}".encode('utf-8')).decode('ascii')
+            if self.auth_enabled else None
+        )
+
+        handler_cls = make_request_handler(
+            self.store, self.broadcaster, self.loop, self.daemon_callbacks, auth_token
+        )
+        # Может бросить OSError (порт занят) — вызывающий код обязан это поймать
         self.httpd = ThreadedHTTPServer((self.host, self.port), handler_cls)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._stopped = False
+
+    def has_listeners(self) -> bool:
+        return self.broadcaster.has_listeners()
 
     def start(self):
         self.thread.start()
-        print(f"[WebUI] Веб-интерфейс запущен на http://{self.host}:{self.port}")
+        auth_note = "" if self.auth_enabled else " (no auth)"
+        print(f"[WebUI] http://{self.host}:{self.port}{auth_note}")
 
     def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        if self._stopped:
+            return
+        self._stopped = True
+        try:
+            self.httpd.shutdown()
+        finally:
+            self.httpd.server_close()
 
     def broadcast_task_update(self, group_id: str, topic: str, status: str, stats: str = "", error: str = "", last_run: str = ""):
         self.broadcaster.broadcast({

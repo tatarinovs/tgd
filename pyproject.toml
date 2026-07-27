@@ -30,10 +30,19 @@ verify = [
     "Pillow>=10.0",
     "av>=12.0",
 ]
+# pip install tgd[daemon] — метрики процесса в веб-интерфейсе
+daemon = [
+    "psutil>=5.9.0",
+]
 
 [project.scripts]
 tgd = "tgd:main"
 tgv = "verify:main"
 
 [tool.setuptools]
-py-modules = ["tgd", "verify", "utils"]
+# Модули лежат в src/ — без package-dir setuptools искал их в корне и собирал
+# пустой пакет. Плюс раньше не были перечислены i18n/store/webui, из-за чего
+# установленный tgd падал на `from i18n import _`.
+package-dir = {"" = "src"}
+py-modules = ["tgd", "verify", "utils", "i18n", "store", "webui"]
+packages = ["TelethonFakeTLS", "TelethonFakeTLS.FakeTLS"]

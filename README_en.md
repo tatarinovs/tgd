@@ -77,12 +77,22 @@ PHONE_NUMBER=+79991234567
 # PROXY=socks5://192.168.1.10:10808
 # PROXY=tg://proxy?server=192.168.1.10&port=443&secret=...
 # TIMEOUT=3600
+# TIMEOUT_PER_MB=6       # Extra timeout seconds per MB of file (0 — single TIMEOUT)
 # RETRIES=3
 # WORKERS=6              # Number of threads for light files
 # HEAVY_WORKERS=1        # Number of threads for heavy files
 # HEAVY_THRESHOLD=100    # Threshold for a "heavy" file in MB
 # QUEUE_SIZE=50          # Maximum file queue length (prefetch depth)
+# TOPIC_SUBDIR=1         # Put every forum topic into its own subfolder
+# INCREMENTAL=0          # Fetch only messages newer than the last successful run
+# WEBUI_USER=admin       # Web UI login (see the daemon section)
+# WEBUI_PASS=            # Web UI password
 ```
+
+> [!TIP]
+> `INCREMENTAL=1` makes repeated runs over large channels much faster, but keep in mind:
+> a file deleted from disk manually or via `tgv --delete` will **not** be downloaded again —
+> the daemon remembers the ID of the last processed message.
 
 ### How to get an API ID and Hash:
 
@@ -116,7 +126,14 @@ tgd --daemon --addr 0.0.0.0:8080 --data /var/lib/tgd
 After launching, open your browser at `http://<SERVER_IP>:8080`.
 
 > [!WARNING]
-> The WebUI has no built-in authentication. **It is highly recommended not to** expose it to the open internet. Use the WebUI only within your local network, or set up access via VPN or a Reverse Proxy (e.g., Nginx) with basic HTTP authentication.
+> By default the Web UI runs **without authentication**. If `--addr` is not bound to `127.0.0.1`, set this in `.env`:
+>
+> ```env
+> WEBUI_USER=admin
+> WEBUI_PASS=a_long_password
+> ```
+>
+> That enables HTTP Basic auth; without it the daemon logs a warning at startup. Basic auth sends the password in clear text, so for internet-facing setups still use a VPN or a Reverse Proxy with HTTPS. Requests coming from other sites (CSRF) are rejected by an `Origin` header check.
 
 ### WebUI Features:
 - **Task Management**: Add channels/groups/topics via links `https://t.me/...`, `@username` or ID.

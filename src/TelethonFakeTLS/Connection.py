@@ -11,18 +11,35 @@ class ConnectionTcpMTProxyFakeTLS(ConnectionTcpMTProxyRandomizedIntermediate):
     def __init__(self, ip, port, dc_id, *, loggers, proxy=None, local_addr=None):
         self.fake_tls_cdc = Ft.MTProxyFakeTLSClientCodec(proxy[2])
 
-        proxy_host = proxy[0]
-        if len(proxy_host) > 60:
-            proxy_host = socket.gethostbyname(proxy[0])
-
-        proxy = proxy_host, proxy[1], self.fake_tls_cdc.secret.hex()
+        # DNS-резолв перенесён в _connect(): socket.gethostbyname() здесь
+        # блокировал event loop на всё время ответа резолвера (а при
+        # недоступном DNS — до таймаута ОС).
+        self._raw_proxy_host = proxy[0]
+        proxy = proxy[0], proxy[1], self.fake_tls_cdc.secret.hex()
 
         super().__init__(ip, port, dc_id, loggers=loggers, proxy=proxy, local_addr=local_addr)
         # Bypassing Telethon's buggy normalize_secret which stupidly truncates 16-byte secrets
         # to 15-bytes if they organically start with "ee" or "dd".
         self._secret = self.fake_tls_cdc.secret
 
+    async def _resolve_proxy_host(self):
+        """Асинхронный DNS вместо блокирующего gethostbyname в конструкторе."""
+        host = self._raw_proxy_host
+        if not host or len(host) <= 60:
+            return
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(
+                host, self._proxy[1], family=socket.AF_INET, type=socket.SOCK_STREAM
+            )
+        except OSError as e:
+            log.warning('FakeTLS: не удалось разрешить %s: %s', host, e)
+            return
+        if infos:
+            self._proxy = (infos[0][4][0],) + tuple(self._proxy[1:])
+
     async def _connect(self, timeout=None, ssl=None):
+        await self._resolve_proxy_host()
+
         if self._local_addr is not None:
             # NOTE: If port is not specified, we use 0 port
             # to notify the OS that port should be chosen randomly

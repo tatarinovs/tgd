@@ -1,3 +1,4 @@
+import os
 import base64
 import re
 from . import EncryptionHelper as Eh
@@ -204,7 +205,12 @@ class MTProxyFakeTLSClientCodec:
             if server_digest != computed_digest:
                 log_msg += 'invalid server digest.'
                 log.warning(log_msg)
-                # raise Exception(log_msg)  # Bypassed to support newer MTProxies
+                # Сверка подписи сервера отключена по умолчанию: часть свежих
+                # MTProxy-серверов её не проходит, и включение сломало бы
+                # рабочие конфигурации. Кто хочет полноценную проверку
+                # (защита от MITM на самом прокси) — FAKETLS_STRICT=1.
+                if os.getenv('FAKETLS_STRICT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+                    raise Exception(log_msg)
             else:
                 log_msg += 'tls auth completed.'
         except Exception as ex:

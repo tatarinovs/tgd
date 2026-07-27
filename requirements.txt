@@ -1,8 +1,22 @@
-telethon>=1.34.0
-python-dotenv>=1.0.0
-python-socks[asyncio]>=2.4.0
-tqdm>=4.66.0
-cryptg>=0.4.0
-FastTelethonhelper>=1.0.7
-cryptography>=41.0.0
+# Полный набор для запуска из исходников и сборки exe.
+# Версии синхронизированы с pyproject.toml, где то же самое разложено по extras
+# (pip install -e ".[fast,verify,daemon]").
+
+# ядро
+telethon>=1.41.2
+python-dotenv>=1.0.1
+python-socks[asyncio]>=2.4.4
+tqdm>=4.67.1
+
+# [fast] — ускорение AES и многопоточная загрузка тяжёлых файлов
+cryptg>=0.5
+cryptography>=41.0
+FastTelethonhelper==1.0.7
+
+# [verify] — проверка целостности медиа (verify.py)
+Pillow>=10.0
+av>=12.0
+
+# [daemon] — метрики процесса в веб-интерфейсе (необязательно: без psutil
+# используется встроенный сэмплер через /proc)
 psutil>=5.9.0

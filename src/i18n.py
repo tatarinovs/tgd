@@ -27,7 +27,12 @@ def get_system_lang():
             pass
             
     if not lang:
-        lang = os.environ.get('LANG', '')
+        # LC_ALL и LANGUAGE приоритетнее LANG — их проверяли не все ветки выше
+        for var in ('LC_ALL', 'LC_MESSAGES', 'LANGUAGE', 'LANG'):
+            value = os.environ.get(var, '')
+            if value:
+                lang = value.split(':')[0]
+                break
 
     if lang and lang.lower().startswith('ru'):
         return 'ru'
@@ -81,6 +86,38 @@ MESSAGES = {
         "err_errors_count": "Errors: {}",
         "warn_psutil_not_found": "psutil not found — using built-in /proc-based resource sampler instead (Linux only; no effect on functionality)",
         "info_restart_requested": "Restart requested from Web UI, restarting the process...",
+
+        # --- argparse ---
+        "app_description": "TGD: Telegram media downloader",
+        "arg_group_id": "Group ID or link (@username, https://t.me/...)",
+        "arg_output_dir": "Output folder",
+        "arg_daemon": "Run in server/daemon mode",
+        "arg_addr": "Web server address (only with -d)",
+        "arg_data": "Data folder (session, groups.json)",
+        "arg_env": "Path to .env",
+        "arg_timeout": "Per-file timeout (overrides .env TIMEOUT)",
+        "arg_retries": "Retries on failure (overrides .env RETRIES)",
+        "arg_workers": "Workers for light files (overrides .env WORKERS)",
+        "arg_heavy_workers": "Workers for heavy files (overrides .env HEAVY_WORKERS)",
+        "arg_heavy_threshold": "'Heavy' file threshold in MB (overrides .env HEAVY_THRESHOLD)",
+        "arg_queue_size": "Queue size (overrides .env QUEUE_SIZE)",
+        "arg_proxy": "SOCKS5/HTTP/MTProto proxy (e.g.: tg://proxy?server=...)",
+        "arg_topic": "Topic (thread) name or ID to download from only",
+
+        # --- runtime ---
+        "summary_done": "Finished! New: {}, Existing: {}, Skipped: {}, Errors: {}",
+        "stop_graceful": "[STOP] Finishing current downloads... (press Ctrl+C again to abort immediately)",
+        "stop_forced": "[FORCED] Aborting immediately...",
+        "warn_flood_wait": "[{}] Telegram rate limit (FloodWait): waiting {} s",
+        "err_port_busy": "Failed to bind web server to {}:{} — {}",
+        "warn_webui_public_no_auth": "Web UI is listening on {} without authentication. Set WEBUI_USER and WEBUI_PASS in .env, or bind to 127.0.0.1.",
+        "info_incremental": "Incremental sync: only messages newer than ID {}",
+        "info_signal_shutdown": "Signal {} received, shutting down gracefully...",
+        "warn_store_corrupt": "{} is corrupted, a backup was saved as {} and an empty list is used",
+        "warn_path_too_long": "Output path is very long, file names will be truncated to {} chars",
+        "err_auth_no_tty": "Not authorized and there is no terminal to enter the code. Run TGD once interactively to create the session file.",
+        "err_proxy_required": "Proxy is configured but could not be used — aborting instead of connecting directly (that would expose your real IP).",
+        "warn_chmod_failed": "Failed to restrict permissions on {}: {}",
     },
     "ru": {
         "warn_fast_not_found": "FastTelethonhelper не найден — тяжёлые файлы будут качаться стандартным методом",
@@ -122,6 +159,38 @@ MESSAGES = {
         "err_errors_count": "Ошибок: {}",
         "warn_psutil_not_found": "psutil не найден — используется встроенный сэмплер ресурсов через /proc (только Linux; на работу демона не влияет)",
         "info_restart_requested": "Запрошен перезапуск из веб-морды, перезапускаем процесс...",
+
+        # --- argparse ---
+        "app_description": "TGD: Загрузчик медиа из Telegram",
+        "arg_group_id": "ID группы или ссылка (@username, https://t.me/...)",
+        "arg_output_dir": "Папка сохранения",
+        "arg_daemon": "Запустить в режиме сервера/демона",
+        "arg_addr": "Адрес веб-сервера (только для -d)",
+        "arg_data": "Папка данных (сессия, groups.json)",
+        "arg_env": "Путь до .env",
+        "arg_timeout": "Таймаут на файл (переопределяет .env TIMEOUT)",
+        "arg_retries": "Попыток при сбое (переопределяет .env RETRIES)",
+        "arg_workers": "Количество воркеров для лёгких файлов (переопределяет .env WORKERS)",
+        "arg_heavy_workers": "Количество воркеров для тяжёлых файлов (переопределяет .env HEAVY_WORKERS)",
+        "arg_heavy_threshold": "Порог 'тяжёлого' файла в МБ (переопределяет .env HEAVY_THRESHOLD)",
+        "arg_queue_size": "Размер очереди (переопределяет .env QUEUE_SIZE)",
+        "arg_proxy": "SOCKS5/HTTP/MTProto прокси (например: tg://proxy?server=...)",
+        "arg_topic": "Название темы (раздела) или ID темы для скачивания только из неё",
+
+        # --- runtime ---
+        "summary_done": "Завершено! Новых: {}, Существует: {}, Пропущено: {}, Ошибок: {}",
+        "stop_graceful": "[СТОП] Завершаем текущие загрузки... (повторный Ctrl+C — прервать немедленно)",
+        "stop_forced": "[ПРИНУДИТЕЛЬНО] Прерываем немедленно...",
+        "warn_flood_wait": "[{}] Ограничение Telegram (FloodWait): ждём {} с",
+        "err_port_busy": "Не удалось занять порт для веб-сервера {}:{} — {}",
+        "warn_webui_public_no_auth": "Веб-интерфейс слушает на {} без авторизации. Задайте WEBUI_USER и WEBUI_PASS в .env либо привяжите его к 127.0.0.1.",
+        "info_incremental": "Инкрементальная синхронизация: только сообщения новее ID {}",
+        "info_signal_shutdown": "Получен сигнал {}, завершаемся корректно...",
+        "warn_store_corrupt": "Файл {} повреждён, сохранена копия {}, используется пустой список",
+        "warn_path_too_long": "Путь сохранения очень длинный, имена файлов будут урезаны до {} символов",
+        "err_auth_no_tty": "Сессия не авторизована, а ввести код некуда — нет терминала. Запустите TGD один раз интерактивно, чтобы создать файл сессии.",
+        "err_proxy_required": "Прокси задан, но использовать его не удалось — прерываем запуск вместо прямого подключения (иначе засветится реальный IP).",
+        "warn_chmod_failed": "Не удалось ограничить права на {}: {}",
     }
 }
 

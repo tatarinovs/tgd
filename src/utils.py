@@ -1,9 +1,69 @@
 import logging
 import os
+import re
 import sys
 import time
 from typing import Optional
 from tqdm import tqdm
+
+
+_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Имена устройств MS-DOS: Win32 резолвит их в объект-устройство в ЛЮБОЙ папке,
+# а не в файл. Критично для имени папки (название группы): канал "CON" или "AUX"
+# роняет makedirs, а "NUL" молча глотает всю закачку. На старых Windows и на
+# сетевых шарах то же самое происходит и с "con.mp4" — парсер обрезал имя по
+# первой точке (Windows 11 это ужесточил до имени без расширения).
+_WIN_RESERVED = {
+    'con', 'prn', 'aux', 'nul',
+    *(f'com{i}' for i in range(1, 10)),
+    *(f'lpt{i}' for i in range(1, 10)),
+}
+
+
+def _truncate_stem(name: str, keep: int) -> str:
+    """Режет основу имени, сохраняя расширение: длинное_имя.mp4 → длинн.mp4."""
+    stem, dot, ext = name.rpartition('.')
+    if dot and 0 < len(ext) <= 8:
+        return stem[:max(1, keep - len(ext) - 1)] + '.' + ext
+    return name[:keep]
+
+
+def sanitize_filename(name: str, max_len: int = 200, max_bytes: int = 250,
+                      guard_reserved: bool = True) -> str:
+    """Очищает имя файла от опасных символов (path traversal, Windows-запрещённые)
+    и укладывает его в лимиты ОС.
+
+    max_len  — символы (лимит Windows на компонент пути);
+    max_bytes — байты в UTF-8 (ext4/APFS считают именно их: 200 кириллических
+                символов — это 400 байт, и запись на NAS падала с ENAMETOOLONG);
+    guard_reserved — экранировать имена устройств MS-DOS. Отключайте, если к
+                результату гарантированно приклеивается префикс (например
+                "{message.id}_"): он и сам снимает проблему, а лишнее
+                подчёркивание только портит имя файла."""
+    name = _UNSAFE_CHARS.sub('_', str(name))
+    name = name.strip('. ')
+    if guard_reserved and name.split('.')[0].lower() in _WIN_RESERVED:
+        name = '_' + name
+    if len(name) > max_len:
+        name = _truncate_stem(name, max_len)
+    while len(name.encode('utf-8', 'ignore')) > max_bytes and len(name) > 1:
+        # Отрезаем по символу: у многобайтных имён шаг в байтах непредсказуем
+        name = _truncate_stem(name, len(name) - 1)
+    return name or 'file'
+
+
+def name_budget(output_dir: str) -> int:
+    """Сколько символов можно отдать под имя файла, чтобы путь влез в лимит ОС.
+    На Windows полный путь ограничен 260 символами (если не включён long paths),
+    и папка вида downloads/<длинное название группы>/ съедает большую его часть."""
+    limit = 259 if os.name == 'nt' else 4095
+    try:
+        used = len(os.path.abspath(output_dir))
+    except Exception:
+        used = len(output_dir)
+    # +1 на разделитель, +24 на суффикс временного файла ".<tag><seq>.part"
+    budget = limit - used - 1 - 24
+    return max(24, min(200, budget))
 
 
 class TqdmStream:
@@ -12,8 +72,16 @@ class TqdmStream:
         if len(x.rstrip()) > 0:
             tqdm.write(x, end='')
 
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
     def flush(self):
         pass
+
+    def isatty(self):
+        # Библиотеки спрашивают об этом у любого потока вывода
+        return getattr(sys.stderr, 'isatty', lambda: False)()
 
 
 def setup_tqdm_logger(name, level=logging.INFO):

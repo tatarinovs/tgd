@@ -1,5 +1,4 @@
 import os
-import re
 import argparse
 import logging
 import asyncio
@@ -8,16 +7,24 @@ import threading
 import glob
 import time
 import json
+import signal
+import itertools
 from collections import Counter
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo
 )
 from tqdm import tqdm
-from utils import setup_tqdm_logger, ProcessResourceSampler
+from utils import setup_tqdm_logger, ProcessResourceSampler, sanitize_filename, name_budget
 from i18n import _, init_lang
+from store import GroupStore
+from webui import WebUIServer
+
+# Язык нужно определить ДО первого вызова _(): часть сообщений (например,
+# предупреждение об отсутствии FastTelethonhelper) печатается ещё на импорте.
+init_lang()
 
 
 # ── Monkey-patch: ускорение AES-CTR для MTProxy ──────────────────────
@@ -100,41 +107,73 @@ def _get_app_dir() -> str:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TGD: Загрузчик из Telegram")
-    parser.add_argument('group_id', type=str, nargs='?', default=None, help="ID группы или ссылка (@username, https://t.me/...)")
-    parser.add_argument('output_dir', type=str, nargs='?', default=None, help="Папка сохранения")
-    parser.add_argument('-d', '--daemon', action='store_true', help="Запустить в режиме сервера/демона")
-    parser.add_argument('--addr', type=str, default="127.0.0.1:8080", help="Адрес веб-сервера (только для -d)")
-    parser.add_argument('--data', type=str, default=None, help="Папка данных (сессия, groups.json)")
-    parser.add_argument('--env', type=str, default='.env', help="Путь до .env")
-    parser.add_argument('--timeout', type=int, default=None, help="Таймаут на файл (переопределяет .env TIMEOUT)")
-    parser.add_argument('--retries', type=int, default=None, help="Попыток при сбое (переопределяет .env RETRIES)")
-    parser.add_argument('--workers', type=int, default=None, help="Количество воркеров для лёгких файлов (переопределяет .env WORKERS)")
-    parser.add_argument('--heavy-workers', type=int, default=None, help="Количество воркеров для тяжёлых файлов (переопределяет .env HEAVY_WORKERS)")
-    parser.add_argument('--heavy-threshold', type=int, default=None, help="Порог 'тяжёлого' файла в МБ (переопределяет .env HEAVY_THRESHOLD)")
-    parser.add_argument('--queue-size', type=int, default=None, help="Размер очереди (переопределяет .env QUEUE_SIZE)")
-    parser.add_argument('--proxy', type=str, default=None, help="SOCKS5/HTTP/MTProto прокси (например: tg://proxy?server=...)")
-    parser.add_argument('--topic', type=str, default=None, help="Название темы (раздела) или ID темы для скачивания только из неё")
+    parser = argparse.ArgumentParser(description=_("app_description"))
+    parser.add_argument('group_id', type=str, nargs='?', default=None, help=_("arg_group_id"))
+    parser.add_argument('output_dir', type=str, nargs='?', default=None, help=_("arg_output_dir"))
+    parser.add_argument('-d', '--daemon', action='store_true', help=_("arg_daemon"))
+    parser.add_argument('--addr', type=str, default="127.0.0.1:8080", help=_("arg_addr"))
+    parser.add_argument('--data', type=str, default=None, help=_("arg_data"))
+    parser.add_argument('--env', type=str, default='.env', help=_("arg_env"))
+    parser.add_argument('--timeout', type=int, default=None, help=_("arg_timeout"))
+    parser.add_argument('--retries', type=int, default=None, help=_("arg_retries"))
+    parser.add_argument('--workers', type=int, default=None, help=_("arg_workers"))
+    parser.add_argument('--heavy-workers', type=int, default=None, help=_("arg_heavy_workers"))
+    parser.add_argument('--heavy-threshold', type=int, default=None, help=_("arg_heavy_threshold"))
+    parser.add_argument('--queue-size', type=int, default=None, help=_("arg_queue_size"))
+    parser.add_argument('--proxy', type=str, default=None, help=_("arg_proxy"))
+    parser.add_argument('--topic', type=str, default=None, help=_("arg_topic"))
     return parser.parse_args()
 
 
+def _env_int(name: str, default: int) -> int:
+    """int из .env с защитой от мусора вроде WORKERS=six."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not a number, using {default}")
+        return default
 
-_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on', 'да')
 
 
-def sanitize_filename(name: str, max_len: int = 200) -> str:
-    """Очищает имя файла от опасных символов (path traversal, Windows-запрещённые)."""
-    name = _UNSAFE_CHARS.sub('_', name)
-    name = name.strip('. ')
-    return name[:max_len] or 'file'
+def apply_config(args):
+    """Единая точка разбора настроек для CLI и демона (раньше два одинаковых блока)."""
+    args.timeout = args.timeout if args.timeout is not None else _env_int('TIMEOUT', 3600)
+    args.retries = args.retries if args.retries is not None else _env_int('RETRIES', 3)
+    args.workers = args.workers if args.workers is not None else _env_int('WORKERS', 6)
+    args.heavy_workers = args.heavy_workers if args.heavy_workers is not None else _env_int('HEAVY_WORKERS', 1)
+    args.heavy_threshold = args.heavy_threshold if args.heavy_threshold is not None else _env_int('HEAVY_THRESHOLD', 100)
+    args.queue_size = args.queue_size if args.queue_size is not None else _env_int('QUEUE_SIZE', 50)
+    # Нижние границы: retries=0 раньше приводил к тому, что download_task
+    # не выполнял ни одной попытки и возвращал None.
+    args.retries = max(1, args.retries)
+    args.workers = max(1, args.workers)
+    args.heavy_workers = max(1, args.heavy_workers)
+    args.queue_size = max(1, args.queue_size)
+    args.timeout = max(30, args.timeout)
+    # Верхняя граница таймаута считается от размера файла: единый TIMEOUT
+    # одинаково душил и 200 КБ, и 2 ГБ.
+    args.timeout_per_mb = max(0, _env_int('TIMEOUT_PER_MB', 6))
+    return args
 
 
-def resolve_file_name(message, heavy_threshold_bytes: int) -> tuple:
+
+def resolve_file_name(message, heavy_threshold_bytes: int, max_name_len: int = 200) -> tuple:
     """
     Возвращает (file_name, is_heavy) или (None, False) если медиа не поддерживается.
     Вынесено отдельно для читаемости и тестируемости.
     """
     media = message.media
+    # Префикс "{id}_" тоже занимает место в бюджете имени
+    max_name_len = max(8, max_name_len - len(str(message.id)) - 1)
 
     if isinstance(media, MessageMediaPhoto):
         return f"{message.id}_photo.jpg", False
@@ -157,7 +196,10 @@ def resolve_file_name(message, heavy_threshold_bytes: int) -> tuple:
             None
         )
         if orig_name:
-            return f"{message.id}_{sanitize_filename(orig_name)}", is_heavy
+            # guard_reserved не нужен: префикс "{id}_" уже уводит имя из
+            # пространства имён устройств MS-DOS
+            safe = sanitize_filename(orig_name, max_name_len, guard_reserved=False)
+            return f"{message.id}_{safe}", is_heavy
 
         mime = doc.mime_type or ""
         ext = mime.split('/')[-1].split(';')[0]
@@ -180,88 +222,169 @@ def resolve_file_name(message, heavy_threshold_bytes: int) -> tuple:
     return None, False
 
 
-async def download_task(client, message, file_name, is_heavy, output_dir, timeout, retries, cancel, show_progress=True, stats=None, stats_lock=None):
+# Временные файлы, которые прямо сейчас пишет ЭТОТ процесс. Стартовая уборка
+# "*.part" смотрит сюда, чтобы не снести файл параллельной задачи, пишущей в ту
+# же папку (две темы одной группы, две группы с одинаковым названием).
+_ACTIVE_TMP = set()
+_ACTIVE_TMP_LOCK = threading.Lock()
+_TMP_SEQ = itertools.count()
+_TMP_TAG = f"{os.getpid():x}"
+
+# Крупный буфер: Telethon отдаёт данные кусками по 512 КБ, и на сетевых дисках
+# (NAS) каждая запись стоит дорого.
+_WRITE_BUFFER = 1024 * 1024
+# Порог накопления байт перед обновлением общей статистики: раньше лок брался
+# на каждый чанк прогресса, то есть тысячи раз в секунду.
+_STATS_FLUSH_BYTES = 1024 * 1024
+_MAX_FLOOD_WAITS = 5
+
+
+def _effective_timeout(base_timeout: int, per_mb: int, size_bytes) -> int:
+    """Таймаут пропорционально размеру: единый TIMEOUT одинаково душил и 200 КБ, и 2 ГБ."""
+    if not size_bytes or per_mb <= 0:
+        return base_timeout
+    return max(base_timeout, int(size_bytes / (1024 * 1024) * per_mb) + 60)
+
+
+async def _sleep_cancellable(seconds: float, cancel) -> bool:
+    """Спит, просыпаясь раз в секунду. False — если во время сна попросили остановиться."""
+    end = time.monotonic() + seconds
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return True
+        if cancel.is_set():
+            return False
+        await asyncio.sleep(min(1.0, remaining))
+
+
+def _remove_quiet(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+async def download_task(client, message, file_name, is_heavy, output_dir, timeout, retries,
+                        cancel, show_progress=True, stats=None, stats_lock=None,
+                        timeout_per_mb=0):
     file_path = os.path.join(output_dir, file_name)
     if os.path.exists(file_path):
         return "exists"
 
-    tmp_path = file_path + ".part"
-
     if cancel.is_set():
         return "skipped"
 
-    for attempt in range(retries):
-        try:
-            pbar = None
-            progress_cb = None
-            last_downloaded = [0]
+    # Уникальный суффикс: общий "<имя>.part" позволял двум задачам писать в один
+    # и тот же временный файл, а стартовой уборке — удалять чужую загрузку.
+    tmp_path = f"{file_path}.{_TMP_TAG}{next(_TMP_SEQ):x}.part"
+    expected_size = getattr(getattr(message, 'file', None), 'size', None)
+    eff_timeout = _effective_timeout(timeout, timeout_per_mb, expected_size)
 
-            def on_progress(current, total):
-                if pbar is not None:
-                    if total and not pbar.total:
-                        pbar.total = total
-                    pbar.update(current - pbar.n)
-                if stats_lock is not None and stats is not None:
-                    inc = current - last_downloaded[0]
-                    if inc > 0:
-                        with stats_lock:
+    with _ACTIVE_TMP_LOCK:
+        _ACTIVE_TMP.add(tmp_path)
+    try:
+        attempt = 0
+        flood_waits = 0
+        while attempt < retries:
+            try:
+                pbar = None
+                counted = [0]     # сколько байт уже учтено в общей статистике
+                reported = [0]    # сколько байт отдал последний колбэк прогресса
+
+                def flush_bytes(force=False):
+                    inc = reported[0] - counted[0]
+                    if inc <= 0 or (not force and inc < _STATS_FLUSH_BYTES):
+                        return
+                    if stats is not None:
+                        if stats_lock is not None:
+                            with stats_lock:
+                                stats["bytes"] += inc
+                        else:
                             stats["bytes"] += inc
-                        last_downloaded[0] = current
+                    counted[0] = reported[0]
 
-            if show_progress:
-                pbar = tqdm(unit='B', unit_scale=True, desc=file_name[:25], leave=False)
+                def on_progress(current, total):
+                    if pbar is not None:
+                        if total and not pbar.total:
+                            pbar.total = total
+                        pbar.update(current - pbar.n)
+                    reported[0] = current
+                    flush_bytes()
 
-            progress_cb = on_progress
+                if show_progress:
+                    pbar = tqdm(unit='B', unit_scale=True, desc=file_name[:25], leave=False)
 
-            try:
-                if is_heavy and HAS_FAST:
-                    # FastTelethonhelper: многопоточная докачка одного файла
-                    with open(tmp_path, 'wb') as f:
-                        await asyncio.wait_for(
-                            fast_download(
-                                client,
-                                message.media.document,
-                                f,
-                                progress_callback=progress_cb
-                            ),
-                            timeout=timeout
-                        )
-                else:
-                    # Стандартный Telethon: потоковая запись без расхода ОЗУ
-                    with open(tmp_path, 'wb') as f:
-                        await asyncio.wait_for(
-                            client.download_media(message, file=f, progress_callback=progress_cb),
-                            timeout=timeout
-                        )
-            finally:
-                if pbar is not None:
-                    pbar.close()
-
-            try:
-                actual_size = os.path.getsize(tmp_path)
-            except OSError:
-                actual_size = 0
-            expected_size = getattr(message.file, 'size', None)
-            if not actual_size or (expected_size and actual_size < expected_size * 0.99):
-                raise ValueError(_("err_incomplete_download", actual_size, expected_size))
-
-            os.replace(tmp_path, file_path)
-            return "done"
-
-        except Exception as e:
-            logger.warning(_("warn_attempt_failed", file_name, attempt + 1, retries, e))
-            if os.path.exists(tmp_path):
                 try:
-                    os.remove(tmp_path)
+                    if is_heavy and HAS_FAST:
+                        # FastTelethonhelper: многопоточная докачка одного файла
+                        with open(tmp_path, 'wb', buffering=_WRITE_BUFFER) as f:
+                            await asyncio.wait_for(
+                                fast_download(
+                                    client,
+                                    message.media.document,
+                                    f,
+                                    progress_callback=on_progress
+                                ),
+                                timeout=eff_timeout
+                            )
+                    else:
+                        # Стандартный Telethon: потоковая запись без расхода ОЗУ
+                        with open(tmp_path, 'wb', buffering=_WRITE_BUFFER) as f:
+                            await asyncio.wait_for(
+                                client.download_media(message, file=f, progress_callback=on_progress),
+                                timeout=eff_timeout
+                            )
+                finally:
+                    flush_bytes(force=True)
+                    if pbar is not None:
+                        pbar.close()
+
+                try:
+                    actual_size = os.path.getsize(tmp_path)
                 except OSError:
-                    pass
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-            else:
-                return "error"
+                    actual_size = 0
+                if not actual_size or (expected_size and actual_size < expected_size * 0.99):
+                    raise ValueError(_("err_incomplete_download", actual_size, expected_size))
+
+                os.replace(tmp_path, file_path)
+                return "done"
+
+            except FloodWaitError as e:
+                # Ограничение со стороны Telegram: ждать нужно столько, сколько
+                # сказал сервер, и не тратить на это попытку — иначе три
+                # мгновенных ретрая просто сжигают файл в "error".
+                _remove_quiet(tmp_path)
+                flood_waits += 1
+                if flood_waits > _MAX_FLOOD_WAITS:
+                    logger.error(_("warn_attempt_failed", file_name, attempt + 1, retries, e))
+                    return "error"
+                wait_for = min(int(getattr(e, 'seconds', 60)) + 2, 3600)
+                logger.warning(_("warn_flood_wait", file_name, wait_for))
+                if not await _sleep_cancellable(wait_for, cancel):
+                    return "skipped"
+
+            except asyncio.CancelledError:
+                _remove_quiet(tmp_path)
+                raise
+
+            except Exception as e:
+                attempt += 1
+                logger.warning(_("warn_attempt_failed", file_name, attempt, retries, e))
+                _remove_quiet(tmp_path)
+                if attempt >= retries:
+                    return "error"
+                if not await _sleep_cancellable(2 ** (attempt - 1), cancel):
+                    return "skipped"
+
+        return "error"
+    finally:
+        with _ACTIVE_TMP_LOCK:
+            _ACTIVE_TMP.discard(tmp_path)
 
 
-async def worker(queue, client, output_dir, timeout, retries, stats, stats_lock, cancel, show_progress=True):
+async def worker(queue, client, output_dir, timeout, retries, stats, stats_lock, cancel,
+                 show_progress=True, timeout_per_mb=0):
     """Воркер из пула — тянет задачи (message, file_name, is_heavy) из очереди до sentinel (None)."""
     while True:
         item = await queue.get()
@@ -272,12 +395,20 @@ async def worker(queue, client, output_dir, timeout, retries, stats, stats_lock,
         message, file_name, is_heavy = item
 
         if cancel.is_set():
+            # Задача была уже в очереди, когда нажали «Стоп». Её нужно учесть:
+            # иначе веб-морда рапортует «Пропущено: 0» при десятках брошенных файлов.
+            with stats_lock:
+                stats["skipped"] += 1
             queue.task_done()
             del item, message
             continue
 
         try:
-            result = await download_task(client, message, file_name, is_heavy, output_dir, timeout, retries, cancel, show_progress=show_progress, stats=stats, stats_lock=stats_lock)
+            result = await download_task(
+                client, message, file_name, is_heavy, output_dir, timeout, retries, cancel,
+                show_progress=show_progress, stats=stats, stats_lock=stats_lock,
+                timeout_per_mb=timeout_per_mb,
+            )
             if result != "skipped":
                 with stats_lock:
                     stats[result] += 1
@@ -296,6 +427,10 @@ async def authorize(client, phone):
     Авторизация: поддерживает 2FA (пароль) и не блокирует event loop на вводе.
     """
     loop = asyncio.get_running_loop()
+
+    if not (sys.stdin and sys.stdin.isatty()):
+        # Под systemd/NAS вводить код некому: раньше демон молча висел на input()
+        raise RuntimeError(_("err_auth_no_tty"))
 
     await client.send_code_request(phone)
     code = await loop.run_in_executor(None, lambda: input(_("prompt_code")).strip())
@@ -358,20 +493,107 @@ def parse_proxy(p_url, client_kwargs):
         logger.info(_("info_socks_proxy", parsed.scheme, parsed.hostname, parsed.port))
 
 
-from store import GroupStore
-from webui import WebUIServer
+def build_client_kwargs(args):
+    """Собирает параметры TelegramClient. Возвращает None, если прокси задан,
+    но непригоден: раньше в этом случае клиент молча шёл напрямую — для того,
+    кто включил прокси ради обхода блокировок, это утечка реального IP."""
+    client_kwargs = {'receive_updates': False}
+    p_url = args.proxy or os.getenv('PROXY')
+    if p_url:
+        try:
+            parse_proxy(p_url, client_kwargs)
+        except Exception as e:
+            logger.warning(_("warn_proxy_parse", e))
+            logger.error(_("err_proxy_required"))
+            return None
+        if not client_kwargs.get('proxy'):
+            logger.error(_("err_proxy_required"))
+            return None
+    return client_kwargs
 
 
-async def download_group_messages(client, group_id, topic_input, output_dir, args, stats, stats_lock, cancel):
+def harden_permissions(path: str):
+    """chmod 600 на файлы с секретами (сессия, .env). На Windows no-op."""
+    if os.name == 'nt' or not os.path.exists(path):
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError as e:
+        logger.warning(_("warn_chmod_failed", path, e))
+
+
+async def resolve_topic(client, entity, topic_input):
+    """Возвращает (topic_id, topic_title) по ID темы или части её названия.
+    (None, "") — тема не найдена. Общая точка для CLI, демона и веб-морды:
+    раньше демон сохранял тему строкой '123 (Название)', которую загрузчик
+    потом пытался разобрать как название и всегда падал в 'тема не найдена'."""
+    from telethon.tl.functions.channels import GetForumTopicsRequest
+
+    raw = str(topic_input).strip()
+    if raw.isdigit():
+        logger.info(_("info_filter_topic", int(raw)))
+        return int(raw), ""
+
+    logger.info(_("info_search_topic", raw))
+    try:
+        result = await client(GetForumTopicsRequest(
+            channel=entity,
+            offset_date=None,
+            offset_id=0,
+            offset_topic=0,
+            limit=100
+        ))
+    except Exception as e:
+        logger.error(_("err_topic_list_fail", e))
+        return None, ""
+
+    needle = raw.lower()
+    for t in (getattr(result, 'topics', None) or []):
+        if needle in (getattr(t, 'title', '') or '').lower():
+            logger.info(_("info_found_topic", t.title, t.id))
+            return t.id, t.title
+
+    logger.error(_("err_topic_not_found", raw))
+    return None, ""
+
+
+async def resolve_topic_id(client, entity, topic_input):
+    topic_id, _topic_title = await resolve_topic(client, entity, topic_input)
+    return topic_id
+
+
+async def download_group_messages(client, group_id, topic_input, output_dir, args, stats,
+                                  stats_lock, cancel, min_id: int = 0) -> int:
+    """Качает медиа группы в output_dir. Возвращает максимальный ID обработанного
+    сообщения — его можно сохранить как чекпоинт для инкрементальной синхронизации."""
     heavy_threshold_bytes = args.heavy_threshold * 1024 * 1024
+    timeout_per_mb = getattr(args, 'timeout_per_mb', 0)
     os.makedirs(output_dir, exist_ok=True)
 
-    for tmp in glob.iglob(os.path.join(output_dir, "*.part")):
+    # Уборка огрызков от прошлых запусков. Файлы, которые прямо сейчас пишет
+    # другая задача этого же процесса, трогать нельзя: на Linux удаление
+    # открытого файла молча ломает чужую загрузку.
+    with _ACTIVE_TMP_LOCK:
+        busy = set(_ACTIVE_TMP)
+    for tmp in glob.iglob(os.path.join(glob.escape(output_dir), "*.part")):
+        if tmp in busy:
+            continue
         try:
             if time.time() - os.path.getmtime(tmp) > 60:
                 os.remove(tmp)
         except OSError:
             pass
+
+    # Один listdir вместо os.path.exists на каждое сообщение: на сетевых дисках
+    # это была самая дорогая операция в цикле обхода истории.
+    try:
+        existing_names = {e.name for e in os.scandir(output_dir) if e.is_file()}
+    except OSError:
+        existing_names = set()
+
+    max_name_len = name_budget(output_dir)
+    if max_name_len < 60:
+        logger.warning(_("warn_path_too_long", max_name_len))
 
     heavy_queue = asyncio.Queue(maxsize=args.queue_size)
     light_queue = asyncio.Queue(maxsize=args.queue_size)
@@ -385,35 +607,9 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
 
     topic_id = None
     if topic_input:
-        from telethon.tl.functions.channels import GetForumTopicsRequest
-        try:
-            topic_id = int(topic_input)
-            logger.info(_("info_filter_topic", topic_id))
-        except ValueError:
-            logger.info(_("info_search_topic", topic_input))
-            try:
-                result = await client(GetForumTopicsRequest(
-                    channel=entity,
-                    offset_date=None,
-                    offset_id=0,
-                    offset_topic=0,
-                    limit=100
-                ))
-                matched_topic = None
-                if result and hasattr(result, 'topics'):
-                    for t in result.topics:
-                        if str(topic_input).lower() in t.title.lower():
-                            matched_topic = t
-                            break
-                if matched_topic:
-                    topic_id = matched_topic.id
-                    logger.info(_("info_found_topic", matched_topic.title, topic_id))
-                else:
-                    logger.error(_("err_topic_not_found", topic_input))
-                    return
-            except Exception as e:
-                logger.error(_("err_topic_list_fail", e))
-                return
+        topic_id = await resolve_topic_id(client, entity, topic_input)
+        if topic_id is None:
+            return 0
 
     show_progress = not getattr(args, 'daemon', False)
 
@@ -426,6 +622,7 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
         stats_lock=stats_lock,
         cancel=cancel,
         show_progress=show_progress,
+        timeout_per_mb=timeout_per_mb,
     )
 
     heavy_workers = [
@@ -440,30 +637,56 @@ async def download_group_messages(client, group_id, topic_input, output_dir, arg
     iter_kwargs = {}
     if topic_id is not None:
         iter_kwargs['reply_to'] = topic_id
+    if min_id > 0:
+        # Инкрементальная синхронизация: сервер сам не отдаст то, что уже скачано
+        iter_kwargs['min_id'] = min_id
+        logger.info(_("info_incremental", min_id))
 
-    async for message in client.iter_messages(entity, **iter_kwargs):
-        if cancel.is_set():
-            break
-        if message.media:
-            file_name, is_heavy = resolve_file_name(message, heavy_threshold_bytes)
+    max_id_seen = min_id
+    try:
+        async for message in client.iter_messages(entity, **iter_kwargs):
+            if cancel.is_set():
+                break
+            if message.id > max_id_seen:
+                max_id_seen = message.id
+            if not message.media:
+                continue
+
+            file_name, is_heavy = resolve_file_name(message, heavy_threshold_bytes, max_name_len)
             if not file_name:
+                continue
+
+            if file_name in existing_names:
+                with stats_lock:
+                    stats["exists"] += 1
                 continue
 
             if is_heavy:
                 await heavy_queue.put((message, file_name, is_heavy))
             else:
                 await light_queue.put((message, file_name, is_heavy))
+    finally:
+        try:
+            for _worker in heavy_workers:
+                await heavy_queue.put(None)
+            for _worker in light_workers:
+                await light_queue.put(None)
 
-    for _worker in heavy_workers:
-        await heavy_queue.put(None)
-    for _worker in light_workers:
-        await light_queue.put(None)
+            await heavy_queue.join()
+            await light_queue.join()
 
-    await heavy_queue.join()
-    await light_queue.join()
+            await asyncio.gather(*heavy_workers, *light_workers, return_exceptions=True)
+        except asyncio.CancelledError:
+            # Демон гасят — добивать очередь уже некому
+            for t in (*heavy_workers, *light_workers):
+                t.cancel()
+            raise
 
-    await asyncio.gather(*heavy_workers)
-    await asyncio.gather(*light_workers)
+    # Чекпоинт двигаем только после полного прохода без потерь: иначе файлы,
+    # упавшие в ошибку, больше никогда не будут перекачаны.
+    if cancel.is_set() or stats.get("error") or stats.get("skipped"):
+        return 0
+    return max_id_seen
 
 
 async def run(args, stats, stats_lock, cancel):
@@ -471,13 +694,7 @@ async def run(args, stats, stats_lock, cancel):
     api_hash = os.getenv('APP_API_HASH')
     phone = os.getenv('PHONE_NUMBER')
 
-    args.timeout = args.timeout if args.timeout is not None else int(os.getenv('TIMEOUT', 3600))
-    args.retries = args.retries if args.retries is not None else int(os.getenv('RETRIES', 3))
-    args.workers = args.workers if args.workers is not None else int(os.getenv('WORKERS', 6))
-    args.heavy_workers = args.heavy_workers if args.heavy_workers is not None else int(os.getenv('HEAVY_WORKERS', 1))
-    env_heavy_threshold = os.getenv('HEAVY_THRESHOLD', '100')
-    args.heavy_threshold = args.heavy_threshold if args.heavy_threshold is not None else int(env_heavy_threshold)
-    args.queue_size = args.queue_size if args.queue_size is not None else int(os.getenv('QUEUE_SIZE', 50))
+    apply_config(args)
 
     if not all([api_id, api_hash, phone]):
         logger.error(_("err_env_missing"))
@@ -516,16 +733,13 @@ async def run(args, stats, stats_lock, cancel):
         default_base_dir = os.getenv('DEFAULT_DOWNLOAD_DIR', 'downloads')
         args.output_dir = os.path.join(default_base_dir, clean_name)
 
-    client_kwargs = {'receive_updates': False}
-    p_url = args.proxy or os.getenv('PROXY')
-    if p_url:
-        try:
-            parse_proxy(p_url, client_kwargs)
-        except Exception as e:
-            logger.warning(_("warn_proxy_parse", e))
+    client_kwargs = build_client_kwargs(args)
+    if client_kwargs is None:
+        return
 
     session_path = os.path.join(_get_app_dir(), 'tg_session')
     async with TelegramClient(session_path, int(api_id), api_hash, **client_kwargs) as client:
+        harden_permissions(session_path + '.session')
         if not await client.is_user_authorized():
             await authorize(client, phone)
 
@@ -537,13 +751,7 @@ async def run_daemon(args, cancel):
     api_hash = os.getenv('APP_API_HASH')
     phone = os.getenv('PHONE_NUMBER')
 
-    args.timeout = args.timeout if args.timeout is not None else int(os.getenv('TIMEOUT', 3600))
-    args.retries = args.retries if args.retries is not None else int(os.getenv('RETRIES', 3))
-    args.workers = args.workers if args.workers is not None else int(os.getenv('WORKERS', 6))
-    args.heavy_workers = args.heavy_workers if args.heavy_workers is not None else int(os.getenv('HEAVY_WORKERS', 1))
-    env_heavy_threshold = os.getenv('HEAVY_THRESHOLD', '100')
-    args.heavy_threshold = args.heavy_threshold if args.heavy_threshold is not None else int(env_heavy_threshold)
-    args.queue_size = args.queue_size if args.queue_size is not None else int(os.getenv('QUEUE_SIZE', 50))
+    apply_config(args)
 
     if not all([api_id, api_hash, phone]):
         logger.error(_("err_env_missing"))
@@ -554,23 +762,28 @@ async def run_daemon(args, cancel):
     groups_path = os.path.join(data_dir, 'groups.json')
     store = GroupStore(groups_path)
 
-    client_kwargs = {'receive_updates': False}
-    p_url = args.proxy or os.getenv('PROXY')
-    if p_url:
-        try:
-            parse_proxy(p_url, client_kwargs)
-        except Exception as e:
-            logger.warning(_("warn_proxy_parse", e))
+    client_kwargs = build_client_kwargs(args)
+    if client_kwargs is None:
+        return
 
     session_path = os.path.join(data_dir, 'tg_session')
     loop = asyncio.get_running_loop()
 
+    # Клиент создаём, но подключаемся позже — сначала нужно убедиться, что порт
+    # веб-сервера свободен, иначе демон падал уже после запроса кода из SMS.
     client = TelegramClient(session_path, int(api_id), api_hash, **client_kwargs)
-    await client.connect()
-    if not await client.is_user_authorized():
-        await authorize(client, phone)
 
     active_tasks = {}
+    active_cancels = {}
+    # Сильные ссылки на фоновые задачи: create_task() без сохранения ссылки
+    # разрешает сборщику мусора убить задачу на середине выполнения.
+    bg_tasks = set()
+
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        bg_tasks.add(task)
+        task.add_done_callback(bg_tasks.discard)
+        return task
 
     async def resolve_and_add(group_input, topic_input):
         try:
@@ -581,28 +794,41 @@ async def run_daemon(args, cancel):
             title = getattr(entity, 'title', str(group_input))
             res_id = getattr(entity, 'id', 0)
 
-            topic_title = topic_input
+            # В store уходит ЧИСТЫЙ id темы, название — отдельным полем.
+            topic_key, topic_title = "", ""
             if topic_input:
-                from telethon.tl.functions.channels import GetForumTopicsRequest
-                try:
-                    t_id = int(topic_input)
-                except ValueError:
-                    try:
-                        res = await client(GetForumTopicsRequest(channel=entity, offset_date=None, offset_id=0, offset_topic=0, limit=100))
-                        if res and hasattr(res, 'topics'):
-                            for t in res.topics:
-                                if topic_input.lower() in t.title.lower():
-                                    topic_title = f"{t.id} ({t.title})"
-                                    break
-                    except Exception:
-                        pass
-            store.add(group_input, title, topic_title, res_id)
+                t_id, t_title = await resolve_topic(client, entity, topic_input)
+                if t_id is not None:
+                    topic_key = str(t_id)
+                    topic_title = t_title or str(topic_input)
+                else:
+                    # Тема не нашлась (например, список тем длиннее 100) —
+                    # сохраняем как ввели, попробуем разрешить при загрузке.
+                    topic_key = str(topic_input)
+                    topic_title = str(topic_input)
+
+            store.add(group_input, title, topic_key, res_id, topic_title)
             logger.info(_("webui_added_group", title, group_input))
         except Exception as e:
             logger.error(_("webui_err_add_group", group_input, e))
             store.add(group_input, group_input, topic_input)
 
-    active_cancels = {}
+    def job_output_dir(g_item, group_id, topic):
+        """Папка загрузки задачи. Раньше зависела только от названия группы:
+        две разные группы с одинаковым title писали в одну папку и затирали
+        файлы друг друга (ID сообщений в разных чатах совпадают)."""
+        title = (g_item or {}).get('title') or str(group_id)
+        folder = sanitize_filename(str(title), 120)
+        taken = {sanitize_filename(str(t), 120) for t in store.titles_before(group_id, topic)}
+        if folder in taken:
+            suffix = str((g_item or {}).get('resolved_id') or group_id)
+            folder = f"{folder}_{sanitize_filename(suffix, 24)}"
+
+        base = os.path.join(data_dir, os.getenv('DEFAULT_DOWNLOAD_DIR', 'downloads'), folder)
+        if topic and _env_flag('TOPIC_SUBDIR', True):
+            label = (g_item or {}).get('topic_title') or f"topic_{topic}"
+            base = os.path.join(base, sanitize_filename(str(label), 64))
+        return base
 
     async def trigger_download(group_id, topic):
         task_key = f"{group_id}|{topic}"
@@ -614,16 +840,17 @@ async def run_daemon(args, cancel):
         active_cancels[task_key] = job_cancel
         active_tasks[task_key] = True
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        import json
         store.update_stats(group_id, topic, status="downloading", stats=json.dumps({"text_key": "preparing"}), last_error="", last_run=ts)
         web_server.broadcast_task_update(group_id, topic, "downloading", json.dumps({"text_key": "preparing"}), "", ts)
 
         async def _download_job():
             try:
                 g_item = store.get(group_id, topic)
-                folder_name = sanitize_filename(g_item.get('title', str(group_id)) if g_item else str(group_id))
-                default_base_dir = os.getenv('DEFAULT_DOWNLOAD_DIR', 'downloads')
-                output_dir = os.path.join(data_dir, default_base_dir, folder_name)
+                output_dir = job_output_dir(g_item, group_id, topic)
+                # Инкрементальная синхронизация выключена по умолчанию: с ней
+                # файл, удалённый с диска вручную или через verify --delete,
+                # уже не будет перекачан.
+                min_id = int((g_item or {}).get('last_max_id') or 0) if _env_flag('INCREMENTAL', False) else 0
 
                 stats = Counter({"done": 0, "exists": 0, "error": 0, "skipped": 0, "bytes": 0})
                 stats_lock = threading.Lock()
@@ -637,20 +864,24 @@ async def run_daemon(args, cancel):
                             await asyncio.sleep(2.0)
                         except asyncio.CancelledError:
                             break
-                        if web_server.broadcaster._listeners:
-                            now = time.time()
-                            dt = now - last_t
-                            with stats_lock:
-                                d = stats['done']
-                                ex = stats['exists']
-                                sk = stats['skipped']
-                                err = stats['error']
-                                cur_b = stats['bytes']
 
-                            speed = ((cur_b - last_b) / dt) / (1024 * 1024) if dt > 0 and (cur_b > last_b) else 0
-                            last_b = cur_b
-                            last_t = now
+                        now = time.time()
+                        dt = now - last_t
+                        with stats_lock:
+                            d = stats['done']
+                            ex = stats['exists']
+                            sk = stats['skipped']
+                            err = stats['error']
+                            cur_b = stats['bytes']
 
+                        speed = ((cur_b - last_b) / dt) / (1024 * 1024) if dt > 0 and (cur_b > last_b) else 0
+                        # Отсечку двигаем всегда, даже когда дашборд никто не
+                        # смотрит: иначе первый замер после открытия страницы
+                        # усреднялся по всему времени простоя и врал в разы.
+                        last_b = cur_b
+                        last_t = now
+
+                        if web_server.has_listeners():
                             if job_cancel.is_set():
                                 cur_status = "stopping"
                                 stats_data = {"text_key": "waiting_stop", "new": d, "exists": ex, "speed": speed}
@@ -662,10 +893,13 @@ async def run_daemon(args, cancel):
                             store.update_stats(group_id, topic, status=cur_status, stats=st_text)
                             web_server.broadcast_task_update(group_id, topic, cur_status, st_text)
 
-                broadcaster_task = asyncio.create_task(_periodic_broadcaster())
+                broadcaster_task = spawn(_periodic_broadcaster())
 
                 try:
-                    await download_group_messages(client, group_id, topic, output_dir, args, stats, stats_lock, job_cancel)
+                    new_max_id = await download_group_messages(
+                        client, group_id, topic, output_dir, args,
+                        stats, stats_lock, job_cancel, min_id=min_id,
+                    )
                 finally:
                     job_done.set()
                     broadcaster_task.cancel()
@@ -682,7 +916,9 @@ async def run_daemon(args, cancel):
                     status_str = "done" if stats['error'] == 0 else "done_errors"
 
                 res_str = json.dumps(stats_data)
-                store.update_stats(group_id, topic, status=status_str, stats=res_str, last_error=err_str, persist=True)
+                checkpoint = new_max_id if new_max_id > min_id else None
+                store.update_stats(group_id, topic, status=status_str, stats=res_str, last_error=err_str,
+                                   last_max_id=checkpoint, persist=True)
                 web_server.broadcast_task_update(group_id, topic, status_str, res_str, err_str)
             except Exception as e:
                 logger.error(_("webui_err_download", group_id, e))
@@ -693,7 +929,7 @@ async def run_daemon(args, cancel):
                 active_cancels.pop(task_key, None)
                 active_tasks.pop(task_key, None)
 
-        asyncio.create_task(_download_job())
+        spawn(_download_job())
 
     async def cancel_download(group_id, topic):
         task_key = f"{group_id}|{topic}"
@@ -730,7 +966,7 @@ async def run_daemon(args, cancel):
             subprocess.Popen(cmd, env=env)
             os._exit(0)
 
-        asyncio.create_task(_do_restart())
+        spawn(_do_restart())
 
     async def _resource_monitor():
         """Раз в несколько секунд шлёт в тот же SSE-канал метрики ТОЛЬКО этого
@@ -741,6 +977,8 @@ async def run_daemon(args, cancel):
         включая NAS без доступа к pip."""
         proc = psutil.Process(os.getpid()) if HAS_PSUTIL else None
         sampler = None if HAS_PSUTIL else ProcessResourceSampler()
+        if not HAS_PSUTIL:
+            logger.info(_("warn_psutil_not_found"))
         if proc:
             proc.cpu_percent(interval=None)  # прайминг — первый вызов всегда вернёт 0.0
         else:
@@ -748,7 +986,7 @@ async def run_daemon(args, cancel):
         started_at = time.time()
         while True:
             await asyncio.sleep(5.0)
-            if not web_server.broadcaster._listeners:
+            if not web_server.has_listeners():
                 continue
             try:
                 if proc:
@@ -773,15 +1011,61 @@ async def run_daemon(args, cancel):
         'restart': restart_daemon,
     }
 
-    host, port_str = args.addr.split(':') if ':' in args.addr else ('127.0.0.1', args.addr)
-    web_server = WebUIServer(host, int(port_str), store, loop, daemon_callbacks)
-    web_server.start()
-    resource_task = asyncio.create_task(_resource_monitor())
-
-    logger.info(_("info_daemon_started", host, port_str))
+    host, port_str = args.addr.rsplit(':', 1) if ':' in args.addr else ('127.0.0.1', args.addr)
+    host = host.strip('[]')  # допускаем запись вида [::1]:8080
     try:
+        port = int(port_str)
+    except ValueError:
+        logger.error(_("err_port_busy", host, port_str, "invalid port"))
+        return
+
+    # Сокет занимаем ДО подключения к Telegram: раньше занятый порт ронял демон
+    # уже после запроса кода подтверждения.
+    try:
+        web_server = WebUIServer(host, port, store, loop, daemon_callbacks)
+    except OSError as e:
+        logger.error(_("err_port_busy", host, port, e))
+        return
+
+    if host not in ('127.0.0.1', 'localhost', '::1') and not web_server.auth_enabled:
+        logger.warning(_("warn_webui_public_no_auth", f"{host}:{port}"))
+
+    try:
+        await client.connect()
+        harden_permissions(session_path + '.session')
+        if not await client.is_user_authorized():
+            await authorize(client, phone)
+
+        web_server.start()
+        spawn(_resource_monitor())
+
+        # SIGTERM от systemd / docker stop / NAS раньше просто убивал процесс
+        def _request_stop(signum):
+            logger.info(_("info_signal_shutdown", signum))
+            cancel.set()
+            for job_cancel in list(active_cancels.values()):
+                job_cancel.set()
+
+        for sig_name in ('SIGINT', 'SIGTERM', 'SIGBREAK'):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                loop.add_signal_handler(sig, _request_stop, int(sig))
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows и не-главный поток: там останов приходит из main()
+                pass
+
+        logger.info(_("info_daemon_started", host, port))
         while not cancel.is_set():
-            await asyncio.sleep(3600)
+            await asyncio.sleep(1.0)
+
+        # Даём активным загрузкам корректно закрыть текущие файлы
+        for job_cancel in list(active_cancels.values()):
+            job_cancel.set()
+        deadline = time.monotonic() + 30
+        while active_tasks and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
     finally:
         web_server.stop()
         pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
@@ -789,6 +1073,7 @@ async def run_daemon(args, cancel):
             t.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        store.save()
         try:
             await client.disconnect()
         except Exception:
@@ -804,11 +1089,23 @@ PHONE_NUMBER=
 # PROXY=tg://proxy?server=...
 # PROXY=socks5://user:pass@127.0.0.1:10808
 # TIMEOUT=3600
+# TIMEOUT_PER_MB=6
 # RETRIES=3
 # WORKERS=6
 # HEAVY_WORKERS=1
 # HEAVY_THRESHOLD=100
 # QUEUE_SIZE=50
+
+# Отдельная подпапка для каждой темы форума (по умолчанию включено)
+# TOPIC_SUBDIR=1
+# Инкрементальная синхронизация: качать только сообщения новее последнего
+# успешного запуска. Ускоряет повторные прогоны, но удалённые с диска файлы
+# заново скачаны НЕ будут.
+# INCREMENTAL=0
+
+# Авторизация веб-интерфейса (обязательна, если --addr смотрит наружу)
+# WEBUI_USER=admin
+# WEBUI_PASS=
 """
 
 
@@ -820,9 +1117,10 @@ def ensure_env_file(env_path: str):
                 os.makedirs(target_dir, exist_ok=True)
             with open(env_path, 'w', encoding='utf-8') as f:
                 f.write(DEFAULT_ENV_TEMPLATE)
-            logger.info(f"Создан шаблон конфигурации: {env_path}")
+            harden_permissions(env_path)  # в файле будут api_hash и номер телефона
+            logger.info(_("info_env_created", env_path))
         except Exception as e:
-            logger.warning(f"Не удалось создать файл {env_path}: {e}")
+            logger.warning(_("warn_env_create_fail", env_path, e))
 
 
 def main():
@@ -863,35 +1161,28 @@ def main():
     thread = threading.Thread(target=_run_thread, daemon=True)
     thread.start()
 
+    # Ctrl+C ловится одинаково в обоих режимах: демон раньше просто убивался
+    # через sys.exit(1), не закрывая ни соединение, ни текущие файлы.
     try:
-        if args.daemon:
-            done.wait()
-        else:
-            while not done.wait(timeout=0.2):
-                pass
+        while not done.wait(timeout=0.2):
+            pass
     except KeyboardInterrupt:
-        if args.daemon:
-            sys.exit(1)
-        sys.stderr.write("\r\033[K\033[33m[СТОП] Завершаем текущие процессы... (повторный Ctrl+C — прервать немедленно)\033[0m\n")
+        sys.stderr.write(f"\r\033[K\033[33m{_('stop_graceful')}\033[0m\n")
         sys.stderr.flush()
         cancel.set()
         try:
             while not done.wait(timeout=0.2):
                 pass
         except KeyboardInterrupt:
-            sys.stderr.write("\r\033[K\033[1;31m[ПРИНУДИТЕЛЬНО] Прерываем немедленно...\033[0m\n")
+            sys.stderr.write(f"\r\033[K\033[1;31m{_('stop_forced')}\033[0m\n")
             sys.stderr.flush()
             sys.exit(1)
 
     if not args.daemon:
         print()
         with stats_lock:
-            logger.info(
-                f"Завершено! Новых: {stats['done']}, "
-                f"Существует: {stats['exists']}, "
-                f"Пропущено: {stats['skipped']}, "
-                f"Ошибок: {stats['error']}"
-            )
+            logger.info(_("summary_done", stats['done'], stats['exists'],
+                          stats['skipped'], stats['error']))
 
 
 if __name__ == '__main__':
